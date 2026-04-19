@@ -11,6 +11,15 @@ An [Open 3D Engine (O3DE)](https://o3de.org) gem providing a data-driven narrati
 
 ---
 
+## Requirements
+
+- O3DE engine **25.10.2** or compatible
+- [Gameplay Tags Foundation](https://github.com/heathen-engineering/O3DE-Foundation-for-GameplayTags) Gem (provides `Heathen::GameplayTag`, conditions, and operations)
+- [Lexicon Localisation Foundaiton](https://github.com/heathen-engineering/O3DE-Lexicon-Foundation) Gem (provides localisation key lookup for `textKey` fields)
+- [xxHash](https://github.com/heathen-engineering/O3DE-xxHash) Gem (provides `xxHash::xxHashFunctions`)
+  
+---
+
 ## Become a GitHub Sponsor
 [![Discord](https://img.shields.io/badge/Discord--1877F2?style=social&logo=discord)](https://discord.gg/6X3xrRc)
 [![GitHub followers](https://img.shields.io/github/followers/heathen-engineering?style=social)](https://github.com/heathen-engineering?tab=followers)
@@ -327,12 +336,3 @@ The **OghamStoryteller** is a dockable editor panel for authoring `.ogmcon` file
 - **Save All** writes all dirty `.ogmcon` files; the Asset Processor picks up changes automatically
 
 Open via **Tools → Ogham Storyteller** in the O3DE Editor menu bar.
-
----
-
-## Requirements
-
-- O3DE engine **25.10.2** or compatible
-- `FoundationGameplayTags` gem (included in this project; provides `Heathen::GameplayTag`, conditions, and operations)
-- `FoundationLocalisation` gem (included in this project; provides localisation key lookup for `textKey` fields)
-- `xxHash` gem (included in this project; provides `xxHash::xxHashFunctions`)
