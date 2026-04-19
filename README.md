@@ -19,6 +19,14 @@ Support Heathen by becoming a [GitHub Sponsor](https://github.com/sponsors/heath
 Sponsors also get access to our private SourceRepo, which includes developer tools for O3DE, Unreal, Unity, and Godot.
 Learn more or explore other ways to support @ [heathen.group/kb](https://heathen.group/kb/do-more/)
 
+### Ogham Storyteller Toolkit
+The **Ogham Storyteller Toolkit** is a sponsor-exclusive extension to this gem that adds professional narrative production features, including:
+
+- **Twine / Twee 3 Importer** — import SugarCube-format `.twee` files directly into `.ogmcon`, with staged review of passage tags, localisation key assignment, variable-to-GameplayTag mapping, and condition/operation preview before committing
+- Additional authoring and pipeline utilities for larger narrative projects
+
+Available to [GitHub Sponsors](https://github.com/sponsors/heathen-engineering) via the private SourceRepo.
+
 ---
 
 ## Core Concept
