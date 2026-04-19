@@ -1,0 +1,141 @@
+/*
+ * Copyright (c) 2026 Heathen Engineering Limited
+ * Irish Registered Company #556277
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <AzCore/Memory/SystemAllocator.h>
+#include <AzCore/RTTI/RTTI.h>
+#include <AzCore/Serialization/SerializeContext.h>
+#include <AzCore/std/containers/vector.h>
+#include <AzCore/std/string/string.h>
+#include <AzCore/Math/Uuid.h>
+
+#include <GameplayTag.h>
+#include <GameplayTagCollection.h>
+#include <GameplayTagCondition.h>
+#include <GameplayTagOperation.h>
+
+namespace FoundationOgham
+{
+    // -------------------------------------------------------------------------
+    // HistoryEntry
+    // -------------------------------------------------------------------------
+
+    ///<summary>
+    /// A single step in the linear narrative history.
+    /// entryId        — the entry that was active.
+    /// selectedOption — the option the player chose; 0 if the entry was
+    ///                  closed externally (interrupt) with no selection.
+    /// History is append-only and is never cleared by ReturnTo.
+    ///</summary>
+    struct HistoryEntry
+    {
+        AZ_TYPE_INFO(HistoryEntry, "{B1C2D3E4-F5A6-7B8C-9D0E-F1A2B3C4D5E6}")
+        AZ_CLASS_ALLOCATOR(HistoryEntry, AZ::SystemAllocator, 0)
+
+        AZ::u64 entryId        = 0;
+        AZ::u64 selectedOption = 0;  ///< 0 = no option chosen (interrupted close)
+
+        static void Reflect(AZ::ReflectContext* context);
+    };
+
+    // -------------------------------------------------------------------------
+    // DialogueOption
+    // -------------------------------------------------------------------------
+
+    ///<summary>
+    /// One selectable choice within a DialogueEntry.
+    ///
+    /// conditions  — if non-empty, all must evaluate true for the option to
+    ///               appear in GetAvailableOptions(). Uses C-style AND/OR/XOR
+    ///               precedence via EvaluateConditions().
+    /// operations  — applied to the narrative state when the option is selected,
+    ///               before the processor navigates to targetEntry.
+    /// targetEntry — the next DialogueEntry. If invalid (id == 0), selecting
+    ///               this option closes the conversation.
+    ///</summary>
+    struct DialogueOption
+    {
+        AZ_TYPE_INFO(DialogueOption, "{C2D3E4F5-A6B7-8C9D-0E1F-A2B3C4D5E6F7}")
+        AZ_CLASS_ALLOCATOR(DialogueOption, AZ::SystemAllocator, 0)
+
+        Heathen::GameplayTag                         tag;
+        AZStd::string                                textKey;       ///< localisation key for the option label
+        Heathen::GameplayTag                         targetEntry;   ///< 0 = close on select
+        AZStd::vector<Heathen::GameplayTagCondition> conditions;
+        AZStd::vector<Heathen::GameplayTagOperation> operations;
+
+        static void Reflect(AZ::ReflectContext* context);
+    };
+
+    // -------------------------------------------------------------------------
+    // DialogueEntry
+    // -------------------------------------------------------------------------
+
+    ///<summary>
+    /// One node in the narrative graph.
+    ///
+    /// textKeys        — one or more localisation keys (narrator, speaker, body …).
+    ///                   The UI layer decides how to display them.
+    /// parentTag       — hierarchical parent used by ReturnTo().  Set to the
+    ///                   parent entry's tag; leave invalid for root entries.
+    /// entryOperations — applied to the narrative state on entry, before
+    ///                   OnDialogueEntered fires.
+    ///</summary>
+    struct DialogueEntry
+    {
+        AZ_TYPE_INFO(DialogueEntry, "{D3E4F5A6-B7C8-9D0E-1F2A-B3C4D5E6F7A8}")
+        AZ_CLASS_ALLOCATOR(DialogueEntry, AZ::SystemAllocator, 0)
+
+        Heathen::GameplayTag                         tag;
+        Heathen::GameplayTag                         parentTag;
+        AZStd::vector<AZStd::string>                 textKeys;
+        AZStd::vector<Heathen::GameplayTagOperation> entryOperations;
+        AZStd::vector<DialogueOption>                options;
+
+        static void Reflect(AZ::ReflectContext* context);
+    };
+
+    // -------------------------------------------------------------------------
+    // OghamSaveState
+    // -------------------------------------------------------------------------
+
+    ///<summary>
+    /// A portable snapshot of the OghamProcessor that can be serialised to disk.
+    ///
+    /// uuid     — unique ID for this save slot; generated by the caller.
+    /// name     — human-readable label.
+    /// state    — full copy of the narrative GameplayTagCollection at save time.
+    /// history  — full copy of the linear history at save time.
+    /// assetId  — the AZ::Data::AssetId of the active OghamAsset (path + sub-id);
+    ///            stored so the save loader can reload the right asset.
+    ///</summary>
+    struct OghamSaveState
+    {
+        AZ_TYPE_INFO(OghamSaveState, "{E4F5A6B7-C8D9-0E1F-2A3B-C4D5E6F7A8B9}")
+        AZ_CLASS_ALLOCATOR(OghamSaveState, AZ::SystemAllocator, 0)
+
+        AZ::Uuid                         uuid    = AZ::Uuid::CreateNull();
+        AZStd::string                    name;
+        AZ::u64                          currentEntryId = 0;
+        Heathen::GameplayTagCollection   state;
+        AZStd::vector<HistoryEntry>      history;
+
+        static void Reflect(AZ::ReflectContext* context);
+    };
+
+} // namespace FoundationOgham
