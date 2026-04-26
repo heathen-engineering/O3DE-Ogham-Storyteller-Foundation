@@ -2,6 +2,18 @@
 set(FILES
     Source/Tools/FoundationOghamEditorSystemComponent.cpp
     Source/Tools/FoundationOghamEditorSystemComponent.h
+    Source/Tools/OghamAliasPinItem.cpp
+    Source/Tools/OghamAliasPinItem.h
+    Source/Tools/OghamConnectionItem.cpp
+    Source/Tools/OghamConnectionItem.h
+    Source/Tools/OghamGraphView.cpp
+    Source/Tools/OghamGraphView.h
+    Source/Tools/OghamNodeItem.cpp
+    Source/Tools/OghamNodeItem.h
+    Source/Tools/OghamPlayPanel.cpp
+    Source/Tools/OghamPlayPanel.h
+    Source/Tools/OghamPlayWidget.cpp
+    Source/Tools/OghamPlayWidget.h
     Source/Tools/OghamStoryteller.cpp
     Source/Tools/OghamStoryteller.h
     Source/Tools/FoundationOgham.qrc

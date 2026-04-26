@@ -15,6 +15,11 @@
  * limitations under the License.
  */
 
+#include "OghamAliasPinItem.h"
+#include "OghamConnectionItem.h"
+#include "OghamGraphView.h"
+#include "OghamNodeItem.h"
+#include "OghamPlayPanel.h"
 #include "OghamStoryteller.h"
 
 #include <AzCore/IO/FileIO.h>
@@ -22,10 +27,18 @@
 
 #include <FoundationLocalisation/LexiconEditorRequestBus.h>
 
+#include <QCloseEvent>
+#include <QColorDialog>
 #include <QComboBox>
 #include <QCompleter>
+#include <QGraphicsScene>
+#include <QMap>
+#include <QPair>
+#include <QSet>
+#include <QSettings>
 #include <QSpinBox>
 
+#include <algorithm>
 #include <climits>
 #include <QDesktopServices>
 #include <QDialog>
@@ -45,6 +58,7 @@
 #include <QJsonParseError>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QScrollArea>
@@ -53,6 +67,9 @@
 #include <QStackedWidget>
 #include <QTimer>
 #include <QToolButton>
+#include <QInputDialog>
+#include <QStackedWidget>
+#include <QTableWidget>
 #include <QTreeWidget>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -65,6 +82,18 @@ namespace FoundationOgham
     static constexpr int kRoleFileIdx  = Qt::UserRole + 0;  // int  (file index in m_loadedFiles)
     static constexpr int kRoleEntryIdx = Qt::UserRole + 1;  // int  (-1 = file header or virtual folder)
     static constexpr int kRoleNodeTag  = Qt::UserRole + 2;  // QString (full dot-path for this node)
+
+    // Per-file node header colours (cycles when more files than palette entries)
+    static const QColor kGraphFileColors[] = {
+        { 0x2d, 0x5a, 0x8e },   // blue
+        { 0x5a, 0x2d, 0x5a },   // violet
+        { 0x2d, 0x5a, 0x3d },   // teal-green
+        { 0x5a, 0x4a, 0x2d },   // amber
+        { 0x5a, 0x2d, 0x2d },   // burgundy
+        { 0x2d, 0x45, 0x5a },   // steel blue
+    };
+    static constexpr int kGraphFileColorCount =
+        static_cast<int>(sizeof(kGraphFileColors) / sizeof(kGraphFileColors[0]));
 
     // =========================================================================
     // AddKeyDialog — modal for adding a missing localisation key to all Lexicons
@@ -185,14 +214,14 @@ namespace FoundationOgham
         }
         else if (!IsValidTagStructure(tag))
         {
-            btn->setText("\xe2\x9c\x97");   // ✗  (U+2717)
+            btn->setText(QString(QChar(0x2717)));   // ✗  (U+2717)
             btn->setStyleSheet("color: #cc3333; font-weight: bold;");
             btn->setToolTip("Invalid tag structure.");
             btn->setEnabled(false);
         }
         else if (knownTags.contains(tag))
         {
-            btn->setText("\xe2\x9c\x93");   // ✓
+            btn->setText(QString(QChar(0x2713)));   // ✓
             btn->setStyleSheet("color: #44aa44; font-weight: bold;");
             btn->setToolTip(QString("Tag '%1' found.").arg(tag));
             btn->setEnabled(false);
@@ -233,6 +262,12 @@ namespace FoundationOgham
         m_openSrcBtn = new QPushButton("Open Source...", toolbar);
         tbLayout->addWidget(m_openSrcBtn);
 
+        tbLayout->addSpacing(16);
+
+        m_layoutBtn = new QPushButton("Layout", toolbar);
+        m_layoutBtn->setToolTip("Auto-arrange all visible nodes (BFS tree layout)");
+        tbLayout->addWidget(m_layoutBtn);
+
         tbLayout->addStretch();
 
         // ── Left: 2-column entry tree ────────────────────────────────────────
@@ -241,8 +276,9 @@ namespace FoundationOgham
         m_tree->setHeaderHidden(true);
         m_tree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
         m_tree->header()->setSectionResizeMode(1, QHeaderView::Fixed);
-        m_tree->setColumnWidth(1, 76);
-        m_tree->setMinimumWidth(260);
+        m_tree->setColumnWidth(1, 100);
+        m_tree->setMinimumWidth(150);
+        m_tree->setContextMenuPolicy(Qt::CustomContextMenu);
 
         // ── Right: stacked panel ─────────────────────────────────────────────
         auto* noSelLabel = new QLabel("Select an entry from the tree to edit.", this);
@@ -253,6 +289,17 @@ namespace FoundationOgham
         formLayout->setContentsMargins(8, 8, 8, 8);
         formLayout->setSpacing(6);
 
+        {
+            m_playFromNodeBtn = new QPushButton(
+                "\xe2\x96\xb6 Play from Node", formContent);
+            m_playFromNodeBtn->setEnabled(false);
+            m_playFromNodeBtn->setStyleSheet(
+                "QPushButton { background-color: #2a5c2a; color: white; "
+                "font-weight: bold; padding: 5px; border-radius: 3px; }"
+                "QPushButton:hover { background-color: #3a7c3a; }"
+                "QPushButton:disabled { background-color: #333333; color: #666666; }");
+            formLayout->addWidget(m_playFromNodeBtn);
+        }
         {
             auto* row = new QHBoxLayout();
             row->addWidget(new QLabel("Tag:", formContent));
@@ -355,19 +402,31 @@ namespace FoundationOgham
         auto* formScroll = new QScrollArea(this);
         formScroll->setWidget(formContent);
         formScroll->setWidgetResizable(true);
-        formScroll->setMinimumWidth(400);
+        formScroll->setMinimumWidth(150);
 
         m_formStack = new QStackedWidget(this);
         m_formStack->addWidget(noSelLabel);
         m_formStack->addWidget(formScroll);
         m_formStack->setCurrentIndex(0);
 
-        // ── Splitter ─────────────────────────────────────────────────────────
+        // ── Graph viewport ────────────────────────────────────────────────────
+        m_graphView = new OghamGraphView(this);
+
+        // ── Inner splitter: graph | form ──────────────────────────────────────
+        m_innerSplitter = new QSplitter(Qt::Horizontal, this);
+        m_innerSplitter->addWidget(m_graphView);
+        m_innerSplitter->addWidget(m_formStack);
+        m_innerSplitter->setStretchFactor(0, 6);
+        m_innerSplitter->setStretchFactor(1, 3);
+        m_formStack->setMinimumWidth(150);
+
+        // ── Outer splitter: tree | inner ──────────────────────────────────────
         m_splitter = new QSplitter(Qt::Horizontal, this);
         m_splitter->addWidget(m_tree);
-        m_splitter->addWidget(m_formStack);
-        m_splitter->setStretchFactor(0, 3);
-        m_splitter->setStretchFactor(1, 7);
+        m_splitter->addWidget(m_innerSplitter);
+        m_splitter->setStretchFactor(0, 2);
+        m_splitter->setStretchFactor(1, 8);
+        m_tree->setMinimumWidth(150);
 
         // ── Status bar ───────────────────────────────────────────────────────
         m_statusLabel = new QLabel("No files loaded.", this);
@@ -376,15 +435,77 @@ namespace FoundationOgham
         auto* mainLayout = new QVBoxLayout(this);
         mainLayout->setContentsMargins(4, 4, 4, 4);
         mainLayout->setSpacing(4);
+        m_mainStack = new QStackedWidget(this);
+        m_mainStack->addWidget(m_splitter);   // page 0: editor
+
         mainLayout->addWidget(toolbar);
-        mainLayout->addWidget(m_splitter, 1);
+        mainLayout->addWidget(m_mainStack, 1);
         mainLayout->addWidget(m_statusLabel);
 
         // ── Connections ──────────────────────────────────────────────────────
         connect(m_newFileBtn,  &QPushButton::clicked, this, &OghamStoryteller::OnNewFile);
         connect(m_saveAllBtn,  &QPushButton::clicked, this, &OghamStoryteller::OnSaveAll);
         connect(m_openSrcBtn,  &QPushButton::clicked, this, &OghamStoryteller::OnOpenSource);
+        connect(m_layoutBtn,   &QPushButton::clicked, this, &OghamStoryteller::OnLayoutGraph);
+        connect(m_playFromNodeBtn, &QPushButton::clicked, this, &OghamStoryteller::OnPlayFromNode);
         connect(m_tagCombo,    &QComboBox::editTextChanged, this, &OghamStoryteller::OnTagEdited);
+
+        // ── Tag rename propagation: fires when user commits the tag field ─────
+        connect(m_tagCombo->lineEdit(), &QLineEdit::editingFinished, this,
+            [this]()
+            {
+                if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
+                const QString newTag = m_tagCombo->currentText();
+                if (!IsValidTagStructure(newTag) || newTag == m_renamedFromTag) return;
+                const QString oldTag = m_renamedFromTag;
+                int refCount = 0;
+                for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
+                {
+                    auto& lf = m_loadedFiles[fi];
+                    bool changed = false;
+                    for (auto& e : lf.entries)
+                    {
+                        for (auto& opt : e.options)
+                        {
+                            if (opt.targetTag == oldTag)
+                            {
+                                opt.targetTag = newTag;
+                                ++refCount;
+                                changed = true;
+                            }
+                        }
+                    }
+                    // Rename alias pins on the renamed entry that carry the old tag as prefix
+                    if (fi == m_selectedFileIdx)
+                    {
+                        auto& entry = lf.entries[m_selectedEntryIdx];
+                        for (auto& ap : entry.aliasPins)
+                        {
+                            if (ap.tag == oldTag)
+                            {
+                                ap.tag = newTag;
+                                ++refCount;
+                                changed = true;
+                            }
+                            else if (ap.tag.startsWith(oldTag + "."))
+                            {
+                                ap.tag = newTag + ap.tag.mid(oldTag.size());
+                                ++refCount;
+                                changed = true;
+                            }
+                        }
+                    }
+                    if (changed)
+                        SetFileDirty(fi, true);
+                }
+                m_renamedFromTag = newTag;
+                if (refCount > 0)
+                {
+                    RebuildGraph();
+                    m_statusLabel->setText(
+                        QString("Updated %1 reference(s) to '%2'.").arg(refCount).arg(newTag));
+                }
+            });
 
         connect(m_tree, &QTreeWidget::currentItemChanged,
             [this](QTreeWidgetItem* current, QTreeWidgetItem*)
@@ -414,7 +535,52 @@ namespace FoundationOgham
 
         m_fileWatcher = new QFileSystemWatcher(this);
         connect(m_fileWatcher, &QFileSystemWatcher::fileChanged,
-            [this](const QString&) { m_watchDebounce->start(); });
+            [this](const QString&)
+            {
+                if (!m_suppressWatcher)
+                    m_watchDebounce->start();
+            });
+
+        // ── Graph weld signals ────────────────────────────────────────────────
+        connect(m_graphView, &OghamGraphView::pinDroppedOnNode,
+            this, &OghamStoryteller::OnPinDroppedOnNode);
+        connect(m_graphView, &OghamGraphView::pinDroppedOnAlias,
+            this, &OghamStoryteller::OnPinDroppedOnAlias);
+        connect(m_graphView, &OghamGraphView::pinDroppedOnCanvas,
+            this, &OghamStoryteller::OnPinDroppedOnCanvas);
+        connect(m_graphView, &OghamGraphView::deleteNodeRequested,
+            this, &OghamStoryteller::OnDeleteNodeFromGraph);
+        connect(m_graphView, &OghamGraphView::deleteAliasPinRequested,
+            this, &OghamStoryteller::OnDeleteAliasPin);
+        connect(m_graphView, &OghamGraphView::createNodeRequested,
+            this, &OghamStoryteller::OnCreateNodeFromCanvas);
+        connect(m_graphView, &OghamGraphView::pinDragStarted,
+            [this]() { m_isInteracting = true; });
+        connect(m_graphView, &OghamGraphView::pinDragEnded,
+            [this]() { m_isInteracting = false; });
+
+        // ── Tree context menu — "Move to file…" ──────────────────────────────
+        connect(m_tree, &QTreeWidget::customContextMenuRequested,
+            [this](const QPoint& pos)
+            {
+                QTreeWidgetItem* item = m_tree->itemAt(pos);
+                if (!item) return;
+                const int fi = item->data(0, kRoleFileIdx).toInt();
+                const int ei = item->data(0, kRoleEntryIdx).toInt();
+                if (fi < 0 || ei < 0 || m_loadedFiles.size() <= 1) return;
+
+                QMenu menu(this);
+                QMenu* moveMenu = menu.addMenu("Move to file\xe2\x80\xa6");
+                for (int dfi = 0; dfi < m_loadedFiles.size(); ++dfi)
+                {
+                    if (dfi == fi) continue;
+                    const QString label = QFileInfo(m_loadedFiles[dfi].path).fileName();
+                    QAction* act = moveMenu->addAction(label);
+                    connect(act, &QAction::triggered,
+                        [this, fi, ei, dfi]() { MoveEntryToFile(fi, ei, dfi); });
+                }
+                menu.exec(m_tree->viewport()->mapToGlobal(pos));
+            });
 
         ClearForm();
     }
@@ -426,10 +592,29 @@ namespace FoundationOgham
     void OghamStoryteller::showEvent(QShowEvent* event)
     {
         QWidget::showEvent(event);
+
+        QSettings cfg("HeathenEngineering", "OghamStoryteller");
+        if (cfg.contains("splitterState"))
+            m_splitter->restoreState(cfg.value("splitterState").toByteArray());
+        else
+            m_splitter->setSizes({ 200, 800 });   // first launch: tree 200px
+        if (cfg.contains("innerSplitterState"))
+            m_innerSplitter->restoreState(cfg.value("innerSplitterState").toByteArray());
+        else
+            m_innerSplitter->setSizes({ 500, 500 }); // first launch: graph 1:1 form
+
         EnsureOghamTagsFile();
         ScanAndLoadAll();
         RebuildTree();
         UpdateStatusBar();
+    }
+
+    void OghamStoryteller::closeEvent(QCloseEvent* event)
+    {
+        QSettings cfg("HeathenEngineering", "OghamStoryteller");
+        cfg.setValue("splitterState",      m_splitter->saveState());
+        cfg.setValue("innerSplitterState", m_innerSplitter->saveState());
+        QWidget::closeEvent(event);
     }
 
     // -------------------------------------------------------------------------
@@ -519,6 +704,247 @@ namespace FoundationOgham
                 QUrl::fromLocalFile(m_loadedFiles[m_selectedFileIdx].path));
     }
 
+    // ── OghamInitStateDialog ─────────────────────────────────────────────────
+    // Local-only dialog for choosing initial tag state before entering play mode.
+    // Loads/saves named states from OghamTestStates.json in the Storyteller folder.
+
+    class OghamInitStateDialog : public QDialog
+    {
+    public:
+        explicit OghamInitStateDialog(QWidget* parent)
+            : QDialog(parent)
+        {
+            setWindowTitle("Set Initial State");
+            setMinimumSize(440, 380);
+            resize(480, 420);
+
+            resolveStatesPath();
+            loadStates();
+
+            auto* mainLayout = new QVBoxLayout(this);
+            mainLayout->setSpacing(8);
+
+            // Saved-state bar
+            auto* stateRow = new QHBoxLayout();
+            stateRow->addWidget(new QLabel("Saved State:", this));
+            m_statesCombo = new QComboBox(this);
+            m_statesCombo->addItem("(blank)");
+            for (const QString& name : m_states.keys())
+                m_statesCombo->addItem(name);
+            stateRow->addWidget(m_statesCombo, 1);
+
+            auto* saveBtn = new QPushButton("Save\xe2\x80\xa6", this);
+            saveBtn->setFixedWidth(64);
+            stateRow->addWidget(saveBtn);
+
+            auto* delBtn = new QPushButton("Delete", this);
+            delBtn->setFixedWidth(64);
+            stateRow->addWidget(delBtn);
+            mainLayout->addLayout(stateRow);
+
+            // Tag/value table
+            mainLayout->addWidget(new QLabel("Tag State:", this));
+            m_table = new QTableWidget(0, 2, this);
+            m_table->setHorizontalHeaderLabels({ "Tag", "Value" });
+            m_table->horizontalHeader()->setStretchLastSection(false);
+            m_table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+            m_table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Fixed);
+            m_table->setColumnWidth(1, 80);
+            mainLayout->addWidget(m_table, 1);
+
+            // Add/Remove row buttons
+            auto* rowBtns = new QHBoxLayout();
+            auto* addRowBtn = new QPushButton("+ Add Tag", this);
+            auto* remRowBtn = new QPushButton("- Remove", this);
+            rowBtns->addWidget(addRowBtn);
+            rowBtns->addWidget(remRowBtn);
+            rowBtns->addStretch();
+            mainLayout->addLayout(rowBtns);
+
+            // Dialog buttons
+            auto* buttons = new QDialogButtonBox(this);
+            auto* playBtn  = buttons->addButton(
+                "\xe2\x96\xb6 Play", QDialogButtonBox::AcceptRole);
+            auto* cancelBtn = buttons->addButton(QDialogButtonBox::Cancel);
+            Q_UNUSED(playBtn); Q_UNUSED(cancelBtn);
+            mainLayout->addWidget(buttons);
+
+            // Connections
+            connect(m_statesCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                this, [this](int) { applySelectedState(); });
+
+            connect(saveBtn, &QPushButton::clicked, this, [this]()
+            {
+                bool ok = false;
+                const QString name = QInputDialog::getText(
+                    this, "Save State", "Name:", QLineEdit::Normal, {}, &ok);
+                if (!ok || name.isEmpty()) return;
+                m_states[name] = currentTableState();
+                saveStates();
+                // Refresh combo preserving position
+                m_statesCombo->blockSignals(true);
+                while (m_statesCombo->count() > 1) m_statesCombo->removeItem(1);
+                for (const QString& n : m_states.keys()) m_statesCombo->addItem(n);
+                const int idx = m_statesCombo->findText(name);
+                m_statesCombo->setCurrentIndex(idx >= 0 ? idx : 0);
+                m_statesCombo->blockSignals(false);
+            });
+
+            connect(delBtn, &QPushButton::clicked, this, [this]()
+            {
+                const QString name = m_statesCombo->currentText();
+                if (name == "(blank)" || !m_states.contains(name)) return;
+                m_states.remove(name);
+                saveStates();
+                m_statesCombo->removeItem(m_statesCombo->currentIndex());
+            });
+
+            connect(addRowBtn, &QPushButton::clicked, this, [this]()
+            {
+                const int row = m_table->rowCount();
+                m_table->insertRow(row);
+                m_table->setItem(row, 0, new QTableWidgetItem(""));
+                m_table->setItem(row, 1, new QTableWidgetItem("0"));
+                m_table->editItem(m_table->item(row, 0));
+            });
+
+            connect(remRowBtn, &QPushButton::clicked, this, [this]()
+            {
+                const int row = m_table->currentRow();
+                if (row >= 0) m_table->removeRow(row);
+            });
+
+            connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
+            connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
+        }
+
+        QHash<QString, int> initialState() const { return currentTableState(); }
+
+    private:
+        void resolveStatesPath()
+        {
+            AZ::IO::FixedMaxPath pp = AZ::Utils::GetProjectPath();
+            if (pp.empty()) return;
+            m_statesPath = QString::fromUtf8(pp.c_str())
+                         + "/Assets/Storyteller/OghamTestStates.json";
+        }
+
+        void loadStates()
+        {
+            QFile f(m_statesPath);
+            if (!f.open(QIODevice::ReadOnly)) return;
+            QJsonParseError err;
+            QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
+            f.close();
+            if (err.error != QJsonParseError::NoError) return;
+
+            const QJsonObject allStates = doc.object().value("states").toObject();
+            for (auto it = allStates.begin(); it != allStates.end(); ++it)
+            {
+                QHash<QString, int> tagMap;
+                const QJsonObject tagObj = it.value().toObject();
+                for (auto jt = tagObj.begin(); jt != tagObj.end(); ++jt)
+                    tagMap[jt.key()] = jt.value().toInt();
+                m_states[it.key()] = tagMap;
+            }
+        }
+
+        void saveStates()
+        {
+            QJsonObject allStates;
+            for (auto it = m_states.begin(); it != m_states.end(); ++it)
+            {
+                QJsonObject tagObj;
+                for (auto jt = it.value().begin(); jt != it.value().end(); ++jt)
+                    tagObj[jt.key()] = jt.value();
+                allStates[it.key()] = tagObj;
+            }
+            QJsonObject root;
+            root["states"] = allStates;
+
+            QFileInfo fi(m_statesPath);
+            fi.dir().mkpath(".");
+
+            QFile f(m_statesPath);
+            if (f.open(QIODevice::WriteOnly | QIODevice::Truncate))
+                f.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+        }
+
+        void applySelectedState()
+        {
+            const QString name = m_statesCombo->currentText();
+            m_table->setRowCount(0);
+            if (name == "(blank)" || !m_states.contains(name)) return;
+            const QHash<QString, int>& state = m_states[name];
+            QStringList keys = state.keys();
+            keys.sort();
+            for (const QString& k : keys)
+            {
+                const int row = m_table->rowCount();
+                m_table->insertRow(row);
+                m_table->setItem(row, 0, new QTableWidgetItem(k));
+                m_table->setItem(row, 1,
+                    new QTableWidgetItem(QString::number(state[k])));
+            }
+        }
+
+        QHash<QString, int> currentTableState() const
+        {
+            QHash<QString, int> result;
+            for (int r = 0; r < m_table->rowCount(); ++r)
+            {
+                const QTableWidgetItem* tagItem = m_table->item(r, 0);
+                const QTableWidgetItem* valItem = m_table->item(r, 1);
+                if (!tagItem || tagItem->text().trimmed().isEmpty()) continue;
+                result[tagItem->text().trimmed()] =
+                    valItem ? valItem->text().toInt() : 0;
+            }
+            return result;
+        }
+
+        QString                            m_statesPath;
+        QHash<QString, QHash<QString,int>> m_states;
+        QComboBox*    m_statesCombo = nullptr;
+        QTableWidget* m_table       = nullptr;
+    };
+
+    // ── OnPlayFromNode ────────────────────────────────────────────────────────
+
+    void OghamStoryteller::OnPlayFromNode()
+    {
+        if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
+
+        OghamInitStateDialog dlg(this);
+        if (dlg.exec() != QDialog::Accepted) return;
+
+        // Close any existing play panel
+        if (m_playPanel)
+        {
+            m_mainStack->setCurrentIndex(0);
+            m_mainStack->removeWidget(m_playPanel);
+            m_playPanel->deleteLater();
+            m_playPanel = nullptr;
+        }
+
+        m_playPanel = new OghamPlayPanel(
+            m_loadedFiles,
+            m_selectedFileIdx,
+            m_selectedEntryIdx,
+            dlg.initialState(),
+            this);
+
+        m_mainStack->addWidget(m_playPanel);   // page 1
+        m_mainStack->setCurrentIndex(1);
+
+        connect(m_playPanel, &OghamPlayPanel::stopRequested, this, [this]()
+        {
+            m_mainStack->setCurrentIndex(0);
+            m_mainStack->removeWidget(m_playPanel);
+            m_playPanel->deleteLater();
+            m_playPanel = nullptr;
+        });
+    }
+
     void OghamStoryteller::OnTagEdited()
     {
         if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
@@ -558,7 +984,7 @@ namespace FoundationOgham
     void OghamStoryteller::OnAddTextKey()
     {
         if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-        m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx].textKeys.append("");
+        m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx].dataKeys.append("");
         SetFileDirty(m_selectedFileIdx, true);
         RebuildTextKeysArea();
     }
@@ -611,7 +1037,7 @@ namespace FoundationOgham
                 LoadedFile lf;
                 lf.path  = fp;
                 lf.dirty = false;
-                ParseFile(fp, lf.entries);
+                ParseFile(fp, lf);
                 merged.append(lf);
             }
         }
@@ -660,7 +1086,7 @@ namespace FoundationOgham
     {
         OghamCondition c;
         c.tag        = co["tag"].toString();
-        c.comparison = co["comparison"].toString(QStringLiteral("Contains"));
+        c.comparison = co["comparison"].toString(QStringLiteral("Exists"));
         c.value      = co["value"].toInt(0);
         c.logicOp    = co["logicOp"].toString(QStringLiteral("AND"));
         return c;
@@ -673,6 +1099,19 @@ namespace FoundationOgham
         o["comparison"] = c.comparison;
         o["value"]      = c.value;
         o["logicOp"]    = c.logicOp;
+        return o;
+    }
+
+    static QPointF ParsePoint(const QJsonObject& o)
+    {
+        return { o["x"].toDouble(0.0), o["y"].toDouble(0.0) };
+    }
+
+    static QJsonObject SerialisePoint(QPointF p)
+    {
+        QJsonObject o;
+        o["x"] = p.x();
+        o["y"] = p.y();
         return o;
     }
 
@@ -728,7 +1167,7 @@ namespace FoundationOgham
 
     // ─────────────────────────────────────────────────────────────────────────
 
-    bool OghamStoryteller::ParseFile(const QString& path, QList<OghamSourceEntry>& out)
+    bool OghamStoryteller::ParseFile(const QString& path, LoadedFile& lf)
     {
         QFile f(path);
         if (!f.open(QIODevice::ReadOnly)) return false;
@@ -738,7 +1177,16 @@ namespace FoundationOgham
         f.close();
         if (doc.isNull()) return false;
 
-        const QJsonArray allEntries = doc.object()["entries"].toArray();
+        const QJsonObject root = doc.object();
+
+        // Read per-file color (stored as RGB integer; absent = invalid/palette default)
+        if (root.contains("fileColor"))
+        {
+            const QRgb rgb = static_cast<QRgb>(root["fileColor"].toInt(-1));
+            lf.fileColor = QColor::fromRgb(rgb);
+        }
+
+        const QJsonArray allEntries = root["entries"].toArray();
         for (const QJsonValue& ev : allEntries)
         {
             QJsonObject eo = ev.toObject();
@@ -746,22 +1194,46 @@ namespace FoundationOgham
             entry.tag             = eo["tag"].toString();
             entry.entryOperations = ParseOperations(eo["entryOperations"].toArray());
 
-            const QJsonArray tks = eo["textKeys"].toArray();
-            for (const QJsonValue& tk : tks) entry.textKeys.append(tk.toString());
+            if (eo.contains("position"))
+                entry.position = ParsePoint(eo["position"].toObject());
+
+            // dataKeys is the current name; textKeys is the legacy fallback
+            const QString keysField = eo.contains("dataKeys") ? "dataKeys" : "textKeys";
+            const QJsonArray tks = eo[keysField].toArray();
+            for (const QJsonValue& tk : tks) entry.dataKeys.append(tk.toString());
+
+            const QJsonArray pins = eo["aliasPins"].toArray();
+            for (const QJsonValue& pv : pins)
+            {
+                QJsonObject po = pv.toObject();
+                OghamAliasPin pin;
+                pin.tag      = po["tag"].toString();
+                pin.pinId    = po["pinId"].toInt(0);
+                if (po.contains("position"))
+                    pin.position = ParsePoint(po["position"].toObject());
+                entry.aliasPins.append(pin);
+            }
 
             const QJsonArray opts = eo["options"].toArray();
             for (const QJsonValue& ov : opts)
             {
                 QJsonObject oo = ov.toObject();
                 OghamSourceOption opt;
-                opt.tag         = oo["tag"].toString();
-                opt.textKey     = oo["textKey"].toString();
-                opt.targetEntry = oo["targetEntry"].toString();
+                opt.tag              = oo["tag"].toString();
+                opt.textKey          = oo["textKey"].toString();
+                // targetTag is the current name; targetEntry is the legacy fallback
+                opt.targetTag        = oo.contains("targetTag")
+                                         ? oo["targetTag"].toString()
+                                         : oo["targetEntry"].toString();
+                opt.targetAliasIndex = oo["targetAliasIndex"].toInt(0);
+                const QJsonArray rds = oo["redirects"].toArray();
+                for (const QJsonValue& rv : rds)
+                    if (rv.isObject()) opt.redirects.append(ParsePoint(rv.toObject()));
                 opt.conditions  = ParseConditions(oo["conditions"].toArray());
                 opt.operations  = ParseOperations(oo["operations"].toArray());
                 entry.options.append(opt);
             }
-            out.append(entry);
+            lf.entries.append(entry);
         }
         return true;
     }
@@ -776,17 +1248,32 @@ namespace FoundationOgham
         {
             QJsonObject eo;
             eo["tag"]             = entry.tag;
+            eo["position"]        = SerialisePoint(entry.position);
             eo["entryOperations"] = SerialiseOperations(entry.entryOperations);
             QJsonArray tks;
-            for (const QString& k : entry.textKeys) tks.append(k);
-            eo["textKeys"] = tks;
+            for (const QString& k : entry.dataKeys) tks.append(k);
+            eo["dataKeys"] = tks;
+            QJsonArray pinsArr;
+            for (const OghamAliasPin& pin : entry.aliasPins)
+            {
+                QJsonObject po;
+                po["tag"]      = pin.tag;
+                po["position"] = SerialisePoint(pin.position);
+                po["pinId"]    = pin.pinId;
+                pinsArr.append(po);
+            }
+            eo["aliasPins"] = pinsArr;
             QJsonArray optsArr;
             for (const OghamSourceOption& opt : entry.options)
             {
                 QJsonObject oo;
-                oo["tag"]         = opt.tag;
-                oo["textKey"]     = opt.textKey;
-                oo["targetEntry"] = opt.targetEntry;
+                oo["tag"]              = opt.tag;
+                oo["textKey"]          = opt.textKey;
+                oo["targetTag"]        = opt.targetTag;
+                oo["targetAliasIndex"] = opt.targetAliasIndex;
+                QJsonArray rdsArr;
+                for (const QPointF& rd : opt.redirects) rdsArr.append(SerialisePoint(rd));
+                oo["redirects"]   = rdsArr;
                 oo["conditions"]  = SerialiseConditions(opt.conditions);
                 oo["operations"]  = SerialiseOperations(opt.operations);
                 optsArr.append(oo);
@@ -795,7 +1282,10 @@ namespace FoundationOgham
             entriesArr.append(eo);
         }
 
-        QJsonObject root; root["entries"] = entriesArr;
+        QJsonObject root;
+        root["entries"] = entriesArr;
+        if (lf.fileColor.isValid())
+            root["fileColor"] = static_cast<int>(lf.fileColor.rgb());
         QFile f(lf.path);
         if (!f.open(QIODevice::WriteOnly))
         {
@@ -1175,6 +1665,14 @@ namespace FoundationOgham
         // Stretch first so buttons sit on the right edge of the column
         hl->addStretch();
 
+        // Eye toggle — show/hide this file's nodes in the graph
+        const bool initVis = (fileIdx < m_loadedFiles.size()) && m_loadedFiles[fileIdx].visible;
+        auto* eyeBtn = new QPushButton(initVis ? "\xe2\x97\x8f" : "\xe2\x97\x8b", w);  // ● / ○
+        eyeBtn->setFixedSize(22, 22);
+        eyeBtn->setStyleSheet(initVis ? "color: #6ab0d0;" : "color: #555555;");
+        eyeBtn->setToolTip(initVis ? "Hide nodes in graph" : "Show nodes in graph");
+        hl->addWidget(eyeBtn);
+
         auto* addRoot = new QPushButton("+", w);
         addRoot->setFixedSize(22, 22);
         addRoot->setToolTip("Add root entry to this file");
@@ -1185,6 +1683,17 @@ namespace FoundationOgham
         openBtn->setToolTip("Open source file");
         hl->addWidget(openBtn);
 
+        connect(eyeBtn, &QPushButton::clicked,
+            [this, fileIdx, eyeBtn]()
+            {
+                if (fileIdx < 0 || fileIdx >= m_loadedFiles.size()) return;
+                m_loadedFiles[fileIdx].visible = !m_loadedFiles[fileIdx].visible;
+                const bool v = m_loadedFiles[fileIdx].visible;
+                eyeBtn->setText(v ? "\xe2\x97\x8f" : "\xe2\x97\x8b");
+                eyeBtn->setStyleSheet(v ? "color: #6ab0d0;" : "color: #555555;");
+                eyeBtn->setToolTip(v ? "Hide nodes in graph" : "Show nodes in graph");
+                ApplyGraphVisibility();
+            });
         connect(addRoot, &QPushButton::clicked,
             [this, fileIdx]() { AddRootEntry(fileIdx); });
         connect(openBtn, &QPushButton::clicked,
@@ -1275,12 +1784,52 @@ namespace FoundationOgham
             fileItem->setData(0, kRoleEntryIdx, -1);
             fileItem->setData(0, kRoleNodeTag,  QString());
 
-            QString filename = QFileInfo(lf.path).fileName();
-            fileItem->setText(0,
-                QString("%1%2").arg(filename).arg(lf.dirty ? "  \u25CF" : ""));
-            QFont ff = fileItem->font(0);
-            ff.setBold(true);
-            fileItem->setFont(0, ff);
+            // Column 0: [color swatch] [filename label]
+            {
+                const QString filename = QFileInfo(lf.path).fileName();
+                const QColor  swatchColor = lf.fileColor.isValid()
+                    ? lf.fileColor
+                    : kGraphFileColors[fi % kGraphFileColorCount];
+
+                auto* headerWidget = new QWidget();
+                auto* hLayout = new QHBoxLayout(headerWidget);
+                hLayout->setContentsMargins(2, 1, 2, 1);
+                hLayout->setSpacing(4);
+
+                auto* colorBtn = new QPushButton(headerWidget);
+                colorBtn->setFixedSize(12, 12);
+                colorBtn->setFlat(true);
+                colorBtn->setToolTip("Click to change file color");
+                colorBtn->setStyleSheet(
+                    QString("QPushButton { background-color: %1; border: 1px solid #666; "
+                            "border-radius: 2px; } "
+                            "QPushButton:hover { border-color: #aaa; }")
+                        .arg(swatchColor.name()));
+                connect(colorBtn, &QPushButton::clicked, [this, fi]()
+                {
+                    QColor cur = m_loadedFiles[fi].fileColor.isValid()
+                        ? m_loadedFiles[fi].fileColor
+                        : kGraphFileColors[fi % kGraphFileColorCount];
+                    QColor chosen = QColorDialog::getColor(cur, this, "File Color");
+                    if (!chosen.isValid()) return;
+                    m_loadedFiles[fi].fileColor = chosen;
+                    SetFileDirty(fi, true);
+                    RebuildTree();
+                    RebuildGraph();
+                });
+                hLayout->addWidget(colorBtn);
+
+                auto* nameLabel = new QLabel(
+                    QString("%1%2").arg(filename).arg(lf.dirty ? "  \u25CF" : ""),
+                    headerWidget);
+                nameLabel->setObjectName("fileNameLabel");
+                QFont lf2 = nameLabel->font();
+                lf2.setBold(true);
+                nameLabel->setFont(lf2);
+                hLayout->addWidget(nameLabel, 1);
+
+                m_tree->setItemWidget(fileItem, 0, headerWidget);
+            }
 
             m_tree->setItemWidget(fileItem, 1, MakeFileButtons(fi));
 
@@ -1362,6 +1911,245 @@ namespace FoundationOgham
         // Restore selection
         if (prevFi >= 0 && prevEi >= 0)
             SelectEntry(prevFi, prevEi);
+
+        RebuildGraph();
+    }
+
+    void OghamStoryteller::RebuildGraph()
+    {
+        QGraphicsScene* scene = m_graphView->graphScene();
+        scene->clear();
+
+        // ── Phase 1: create nodes and build tag lookup ────────────────────────
+        QMap<QString, OghamNodeItem*> tagToNode;
+
+        for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
+        {
+            const LoadedFile& lf = m_loadedFiles[fi];
+            for (int ei = 0; ei < lf.entries.size(); ++ei)
+            {
+                const OghamSourceEntry& entry = lf.entries[ei];
+
+                QStringList optTags;
+                for (const OghamSourceOption& opt : entry.options)
+                {
+                    const QString lexVal = opt.textKey.isEmpty() ? QString()
+                                        : FetchLexiconValueForKey(opt.textKey);
+                    optTags.append(opt.tag.isEmpty()
+                        ? (lexVal.isEmpty() ? opt.textKey : lexVal)
+                        : opt.tag);
+                }
+
+                const QColor hdrColor = m_loadedFiles[fi].fileColor.isValid()
+                    ? m_loadedFiles[fi].fileColor
+                    : kGraphFileColors[fi % kGraphFileColorCount];
+                auto* node = new OghamNodeItem(fi, ei, entry.tag, optTags, hdrColor);
+
+                node->setPos(entry.position);
+
+                scene->addItem(node);
+                if (!entry.tag.isEmpty())
+                    tagToNode[entry.tag] = node;
+
+                connect(node, &OghamNodeItem::positionChanged,
+                    [this](int nfi, int nei, QPointF p)
+                    {
+                        if (nfi < 0 || nfi >= m_loadedFiles.size()) return;
+                        auto& entries = m_loadedFiles[nfi].entries;
+                        if (nei < 0 || nei >= entries.size()) return;
+                        entries[nei].position = p;
+                        m_loadedFiles[nfi].dirty = true;
+                    });
+
+                connect(node, &OghamNodeItem::entrySelected,
+                    [this](int nfi, int nei)
+                    {
+                        PopulateForm(nfi, nei);
+                        SelectEntry(nfi, nei);
+                    });
+
+                connect(node, &OghamNodeItem::grabStarted,
+                    [this](int, int) { m_isInteracting = true; });
+                connect(node, &OghamNodeItem::grabEnded,
+                    [this](int, int) { m_isInteracting = false; TrySave(); });
+
+                connect(node, &OghamNodeItem::createAliasPinRequested,
+                    this, &OghamStoryteller::OnCreateAliasPin);
+                connect(node, &OghamNodeItem::duplicateNodeRequested,
+                    this, &OghamStoryteller::OnDuplicateNode);
+                connect(node, &OghamNodeItem::deleteNodeRequested,
+                    this, &OghamStoryteller::OnDeleteNodeFromGraph);
+            }
+        }
+
+        // ── Phase 1b: create alias pins ───────────────────────────────────────
+        // Key: (entryTag, pinId) → alias pin item
+        QMap<QPair<QString,int>, OghamAliasPinItem*> aliasPinMap;
+
+        for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
+        {
+            const LoadedFile& lf = m_loadedFiles[fi];
+            for (int ei = 0; ei < lf.entries.size(); ++ei)
+            {
+                const OghamSourceEntry& entry = lf.entries[ei];
+                OghamNodeItem* parentNode = tagToNode.value(entry.tag);
+
+                for (int pi = 0; pi < entry.aliasPins.size(); ++pi)
+                {
+                    const OghamAliasPin& ap = entry.aliasPins[pi];
+
+                    auto* apItem = new OghamAliasPinItem(fi, ei, ap.pinId, entry.tag);
+
+                    // Auto-layout near parent node if position not set
+                    QPointF apPos = ap.position;
+                    if (apPos.isNull() && parentNode)
+                        apPos = parentNode->pos() + QPointF(OghamNodeItem::kNodeWidth + 30.0,
+                                                            pi * 50.0);
+                    apItem->setPos(apPos);
+                    scene->addItem(apItem);
+                    aliasPinMap[{entry.tag, ap.pinId}] = apItem;
+
+                    // Update alias pin position in data model on drag-release
+                    connect(apItem, &OghamAliasPinItem::positionInDataChanged,
+                        [this](int nfi, int nei, int pid, QPointF p)
+                        {
+                            if (nfi < 0 || nfi >= m_loadedFiles.size()) return;
+                            auto& entries = m_loadedFiles[nfi].entries;
+                            if (nei < 0 || nei >= entries.size()) return;
+                            for (OghamAliasPin& pin : entries[nei].aliasPins)
+                                if (pin.pinId == pid) { pin.position = p; break; }
+                            SetFileDirty(nfi, true);
+                        });
+
+                    // Double-click: select and focus owning node (live scene lookup avoids stale pointers)
+                    connect(apItem, &OghamAliasPinItem::nodeRequested,
+                        [this](int nfi, int nei)
+                        {
+                            if (nfi < 0 || nfi >= m_loadedFiles.size()) return;
+                            if (nei < 0 || nei >= m_loadedFiles[nfi].entries.size()) return;
+                            OghamNodeItem* n = nullptr;
+                            for (QGraphicsItem* gi : m_graphView->graphScene()->items())
+                            {
+                                if (auto* ni = dynamic_cast<OghamNodeItem*>(gi))
+                                {
+                                    if (ni->fileIdx() == nfi && ni->entryIdx() == nei)
+                                        { n = ni; break; }
+                                }
+                            }
+                            if (n)
+                            {
+                                m_graphView->graphScene()->clearSelection();
+                                n->setSelected(true);
+                                m_graphView->centerOn(n);
+                            }
+                            PopulateForm(nfi, nei);
+                            SelectEntry(nfi, nei);
+                        });
+                }
+            }
+        }
+
+        // ── Phase 2: create connections ───────────────────────────────────────
+        for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
+        {
+            const LoadedFile& lf = m_loadedFiles[fi];
+            for (int ei = 0; ei < lf.entries.size(); ++ei)
+            {
+                OghamNodeItem* srcNode = tagToNode.value(lf.entries[ei].tag);
+                if (!srcNode) continue;
+
+                for (int oi = 0; oi < lf.entries[ei].options.size(); ++oi)
+                {
+                    const OghamSourceOption& opt = lf.entries[ei].options[oi];
+                    if (opt.targetTag.isEmpty()) continue;
+
+                    OghamConnectionItem* conn = nullptr;
+
+                    if (opt.targetAliasIndex == 0)
+                    {
+                        // Target is the node's own input pin
+                        OghamNodeItem* dstNode = tagToNode.value(opt.targetTag);
+                        if (!dstNode) continue;
+
+                        conn = new OghamConnectionItem(srcNode, oi,
+                            [dstNode]() { return dstNode->inputPinScenePos(); },
+                            opt.redirects, dstNode->fileIdx());
+
+                        connect(dstNode, &OghamNodeItem::positionChanged, conn,
+                            [conn](int, int, QPointF) { conn->refreshPath(); });
+                    }
+                    else
+                    {
+                        // Target is an alias pin
+                        OghamAliasPinItem* ap = aliasPinMap.value({opt.targetTag, opt.targetAliasIndex});
+                        if (!ap) continue;
+
+                        conn = new OghamConnectionItem(srcNode, oi,
+                            [ap]() { return ap->inputPinScenePos(); },
+                            opt.redirects, ap->fileIdx());
+
+                        connect(ap, &OghamAliasPinItem::positionChanged, conn,
+                            [conn](QPointF) { conn->refreshPath(); });
+                    }
+
+                    scene->addItem(conn);
+
+                    // Persist redirect waypoint edits back to the data model
+                    connect(conn, &OghamConnectionItem::redirectsChanged,
+                        this, [this, fi, ei, oi](QVector<QPointF> rds)
+                        {
+                            if (fi < 0 || fi >= m_loadedFiles.size()) return;
+                            auto& entries = m_loadedFiles[fi].entries;
+                            if (ei < 0 || ei >= entries.size()) return;
+                            if (oi < 0 || oi >= entries[ei].options.size()) return;
+                            entries[ei].options[oi].redirects = rds;
+                            SetFileDirty(fi, true);
+                        });
+                }
+            }
+        }
+
+        ApplyGraphVisibility();
+    }
+
+    void OghamStoryteller::ApplyGraphVisibility()
+    {
+        QGraphicsScene* scene = m_graphView->graphScene();
+        for (QGraphicsItem* item : scene->items())
+        {
+            if (auto* node = dynamic_cast<OghamNodeItem*>(item))
+            {
+                const int nfi = node->fileIdx();
+                const bool vis = (nfi >= 0 && nfi < m_loadedFiles.size()) &&
+                                  m_loadedFiles[nfi].visible;
+                node->setVisible(vis);
+            }
+            else if (auto* ap = dynamic_cast<OghamAliasPinItem*>(item))
+            {
+                const int nfi = ap->fileIdx();
+                const bool vis = (nfi >= 0 && nfi < m_loadedFiles.size()) &&
+                                  m_loadedFiles[nfi].visible;
+                ap->setVisible(vis);
+            }
+            else if (auto* conn = dynamic_cast<OghamConnectionItem*>(item))
+            {
+                const int sfi = conn->srcFileIdx();
+                const int dfi = conn->dstFileIdx();
+                const bool srcVis = (sfi >= 0 && sfi < m_loadedFiles.size()) &&
+                                     m_loadedFiles[sfi].visible;
+                const bool dstVis = (dfi < 0 || dfi >= m_loadedFiles.size()) ||
+                                     m_loadedFiles[dfi].visible;
+                if (!srcVis)
+                {
+                    conn->setVisible(false);
+                }
+                else
+                {
+                    conn->setVisible(true);
+                    conn->setOpacity(dstVis ? 1.0 : 0.3);
+                }
+            }
+        }
     }
 
     void OghamStoryteller::SelectEntry(int fileIdx, int entryIdx)
@@ -1389,15 +2177,22 @@ namespace FoundationOgham
     // Entry CRUD
     // -------------------------------------------------------------------------
 
-    static QString UniqueTag(const QList<OghamSourceEntry>& entries, const QString& base)
+    // Returns a tag unique across ALL loaded files. Tries base (no suffix) first,
+    // then base1, base2, … to find the next available slot.
+    static QString UniqueTagGlobal(const QList<LoadedFile>& files, const QString& base)
     {
+        auto isTaken = [&](const QString& candidate) -> bool
+        {
+            for (const auto& lf : files)
+                for (const auto& e : lf.entries)
+                    if (e.tag == candidate) return true;
+            return false;
+        };
+        if (!isTaken(base)) return base;
         for (int n = 1; ; ++n)
         {
-            QString candidate = base + QString::number(n);
-            bool dup = false;
-            for (const auto& e : entries)
-                if (e.tag == candidate) { dup = true; break; }
-            if (!dup) return candidate;
+            const QString candidate = base + QString::number(n);
+            if (!isTaken(candidate)) return candidate;
         }
     }
 
@@ -1407,7 +2202,7 @@ namespace FoundationOgham
         auto& lf = m_loadedFiles[fileIdx];
 
         OghamSourceEntry entry;
-        entry.tag = UniqueTag(lf.entries, "NewEntry");
+        entry.tag = UniqueTagGlobal(m_loadedFiles, "Dialogue.NewNode");
         lf.entries.append(entry);
 
         SetFileDirty(fileIdx, true);
@@ -1421,10 +2216,11 @@ namespace FoundationOgham
         if (fileIdx < 0 || fileIdx >= m_loadedFiles.size()) return;
         auto& lf = m_loadedFiles[fileIdx];
 
-        int dot    = siblingTag.lastIndexOf('.');
-        QString base = (dot < 0) ? "NewEntry" : siblingTag.left(dot) + ".NewEntry";
+        const int dot = siblingTag.lastIndexOf('.');
+        const QString base = (dot < 0) ? "Dialogue.NewNode"
+                                       : siblingTag.left(dot) + ".NewNode";
         OghamSourceEntry entry;
-        entry.tag = UniqueTag(lf.entries, base);
+        entry.tag = UniqueTagGlobal(m_loadedFiles, base);
         lf.entries.append(entry);
 
         SetFileDirty(fileIdx, true);
@@ -1439,7 +2235,7 @@ namespace FoundationOgham
         auto& lf = m_loadedFiles[fileIdx];
 
         OghamSourceEntry entry;
-        entry.tag = UniqueTag(lf.entries, parentTag + ".NewEntry");
+        entry.tag = UniqueTagGlobal(m_loadedFiles, parentTag + ".NewNode");
         lf.entries.append(entry);
 
         SetFileDirty(fileIdx, true);
@@ -1481,6 +2277,379 @@ namespace FoundationOgham
         RebuildTree();
     }
 
+    void OghamStoryteller::MoveEntryToFile(int srcFi, int srcEi, int dstFi)
+    {
+        if (srcFi < 0 || srcFi >= m_loadedFiles.size()) return;
+        if (dstFi < 0 || dstFi >= m_loadedFiles.size()) return;
+        auto& srcEntries = m_loadedFiles[srcFi].entries;
+        if (srcEi < 0 || srcEi >= srcEntries.size()) return;
+
+        OghamSourceEntry moved = srcEntries.takeAt(srcEi);
+        m_loadedFiles[dstFi].entries.append(moved);
+        const int newEi = m_loadedFiles[dstFi].entries.size() - 1;
+
+        SetFileDirty(srcFi, true);
+        SetFileDirty(dstFi, true);
+
+        if (m_selectedFileIdx == srcFi && m_selectedEntryIdx == srcEi)
+        {
+            m_selectedFileIdx  = dstFi;
+            m_selectedEntryIdx = newEi;
+        }
+        else if (m_selectedFileIdx == srcFi && m_selectedEntryIdx > srcEi)
+        {
+            --m_selectedEntryIdx;
+        }
+
+        RebuildTree();
+        SelectEntry(dstFi, newEi);
+    }
+
+    // ── Graph weld handlers ───────────────────────────────────────────────────
+
+    void OghamStoryteller::OnPinDroppedOnNode(OghamNodeItem* src, int optIdx, OghamNodeItem* dst)
+    {
+        const int fi = src->fileIdx();
+        const int ei = src->entryIdx();
+        if (fi < 0 || fi >= m_loadedFiles.size()) return;
+        auto& entries = m_loadedFiles[fi].entries;
+        if (ei < 0 || ei >= entries.size()) return;
+        if (optIdx < 0 || optIdx >= entries[ei].options.size()) return;
+
+        entries[ei].options[optIdx].targetTag        = dst->tag();
+        entries[ei].options[optIdx].targetAliasIndex = 0;
+        SetFileDirty(fi, true);
+        RebuildGraph();
+    }
+
+    void OghamStoryteller::OnPinDroppedOnAlias(OghamNodeItem* src, int optIdx, OghamAliasPinItem* dst)
+    {
+        const int fi = src->fileIdx();
+        const int ei = src->entryIdx();
+        if (fi < 0 || fi >= m_loadedFiles.size()) return;
+        auto& entries = m_loadedFiles[fi].entries;
+        if (ei < 0 || ei >= entries.size()) return;
+        if (optIdx < 0 || optIdx >= entries[ei].options.size()) return;
+
+        const int dfi = dst->fileIdx();
+        const int dei = dst->entryIdx();
+        if (dfi < 0 || dfi >= m_loadedFiles.size()) return;
+        if (dei < 0 || dei >= m_loadedFiles[dfi].entries.size()) return;
+
+        // Use the parent ENTRY's tag (not the alias's own label) so aliasPinMap lookup works.
+        entries[ei].options[optIdx].targetTag        = m_loadedFiles[dfi].entries[dei].tag;
+        entries[ei].options[optIdx].targetAliasIndex = dst->pinId();
+        SetFileDirty(fi, true);
+        RebuildGraph();
+    }
+
+    void OghamStoryteller::OnPinDroppedOnCanvas(OghamNodeItem* src, int optIdx, QPointF scenePos)
+    {
+        const int fi = src->fileIdx();
+        const int ei = src->entryIdx();
+        if (fi < 0 || fi >= m_loadedFiles.size()) return;
+        auto& lf = m_loadedFiles[fi];
+        if (ei < 0 || ei >= lf.entries.size()) return;
+        if (optIdx < 0 || optIdx >= lf.entries[ei].options.size()) return;
+
+        const QString newTag = UniqueTagGlobal(m_loadedFiles, "Dialogue.NewNode");
+        OghamSourceEntry newEntry;
+        newEntry.tag      = newTag;
+        newEntry.position = scenePos;
+        lf.entries.append(newEntry);
+        const int newEi = lf.entries.size() - 1;
+
+        lf.entries[ei].options[optIdx].targetTag        = newTag;
+        lf.entries[ei].options[optIdx].targetAliasIndex = 0;
+        SetFileDirty(fi, true);
+        RebuildTree();
+        SelectEntry(fi, newEi);
+    }
+
+    void OghamStoryteller::OnCreateAliasPin(int fileIdx, int entryIdx, QPointF scenePos)
+    {
+        if (fileIdx < 0 || fileIdx >= m_loadedFiles.size()) return;
+        auto& lf = m_loadedFiles[fileIdx];
+        if (entryIdx < 0 || entryIdx >= lf.entries.size()) return;
+        auto& entry = lf.entries[entryIdx];
+
+        // Generate a unique pinId
+        int maxId = 0;
+        for (const auto& ap : entry.aliasPins)
+            maxId = qMax(maxId, ap.pinId);
+
+        OghamAliasPin pin;
+        pin.pinId    = maxId + 1;
+        pin.tag      = entry.tag + ".Alias" + QString::number(pin.pinId);
+        pin.position = scenePos;
+        entry.aliasPins.append(pin);
+
+        SetFileDirty(fileIdx, true);
+        RebuildGraph();
+    }
+
+    void OghamStoryteller::OnDuplicateNode(int fileIdx, int entryIdx)
+    {
+        if (fileIdx < 0 || fileIdx >= m_loadedFiles.size()) return;
+        auto& lf = m_loadedFiles[fileIdx];
+        if (entryIdx < 0 || entryIdx >= lf.entries.size()) return;
+
+        OghamSourceEntry copy = lf.entries[entryIdx];
+        copy.tag      = UniqueTagGlobal(m_loadedFiles, copy.tag);
+        copy.position = copy.position + QPointF(40.0, 40.0);
+        copy.aliasPins.clear();   // alias pins are pinId-keyed; don't duplicate them
+
+        lf.entries.append(copy);
+        const int newEi = lf.entries.size() - 1;
+
+        SetFileDirty(fileIdx, true);
+        RebuildTree();
+        RebuildGraph();
+        SelectEntry(fileIdx, newEi);
+    }
+
+    void OghamStoryteller::OnDeleteNodeFromGraph(int fileIdx, int entryIdx)
+    {
+        if (fileIdx < 0 || fileIdx >= m_loadedFiles.size()) return;
+        auto& lf = m_loadedFiles[fileIdx];
+        if (entryIdx < 0 || entryIdx >= lf.entries.size()) return;
+
+        const QString deletedTag = lf.entries[entryIdx].tag;
+
+        // Clear all option targetTags pointing to the deleted entry across all files
+        int cleared = 0;
+        for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
+        {
+            bool changed = false;
+            for (auto& e : m_loadedFiles[fi].entries)
+            {
+                for (auto& opt : e.options)
+                {
+                    if (opt.targetTag == deletedTag)
+                    {
+                        opt.targetTag        = QString();
+                        opt.targetAliasIndex = 0;
+                        ++cleared;
+                        changed = true;
+                    }
+                }
+            }
+            if (changed)
+                SetFileDirty(fi, true);
+        }
+
+        lf.entries.removeAt(entryIdx);
+        SetFileDirty(fileIdx, true);
+
+        if (m_selectedFileIdx == fileIdx)
+        {
+            if (m_selectedEntryIdx == entryIdx)
+            {
+                m_selectedFileIdx  = -1;
+                m_selectedEntryIdx = -1;
+                ClearForm();
+            }
+            else if (m_selectedEntryIdx > entryIdx)
+            {
+                --m_selectedEntryIdx;
+            }
+        }
+
+        RebuildTree();
+        RebuildGraph();
+
+        const QString msg = cleared > 0
+            ? QString("Deleted '%1' — %2 reference(s) cleared.").arg(deletedTag).arg(cleared)
+            : QString("Deleted '%1'.").arg(deletedTag);
+        m_statusLabel->setText(msg);
+    }
+
+    void OghamStoryteller::OnDeleteAliasPin(int fileIdx, int entryIdx, int pinId)
+    {
+        if (fileIdx < 0 || fileIdx >= m_loadedFiles.size()) return;
+        auto& lf = m_loadedFiles[fileIdx];
+        if (entryIdx < 0 || entryIdx >= lf.entries.size()) return;
+        auto& pins = lf.entries[entryIdx].aliasPins;
+
+        const int before = pins.size();
+        pins.erase(std::remove_if(pins.begin(), pins.end(),
+            [pinId](const OghamAliasPin& p) { return p.pinId == pinId; }), pins.end());
+
+        if (pins.size() == before) return;
+
+        // Clear any options that pointed to this alias pin
+        const QString entryTag = lf.entries[entryIdx].tag;
+        for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
+        {
+            bool changed = false;
+            for (auto& e : m_loadedFiles[fi].entries)
+            {
+                for (auto& opt : e.options)
+                {
+                    if (opt.targetTag == entryTag && opt.targetAliasIndex == pinId)
+                    {
+                        opt.targetAliasIndex = 0;
+                        changed = true;
+                    }
+                }
+            }
+            if (changed) SetFileDirty(fi, true);
+        }
+
+        SetFileDirty(fileIdx, true);
+        RebuildGraph();
+    }
+
+    void OghamStoryteller::OnCreateNodeFromCanvas(QPointF scenePos)
+    {
+        if (m_loadedFiles.isEmpty()) return;
+
+        // Pick the first visible file as the target
+        int targetFi = -1;
+        for (int i = 0; i < m_loadedFiles.size(); ++i)
+            if (m_loadedFiles[i].visible) { targetFi = i; break; }
+        if (targetFi < 0) targetFi = 0;
+
+        const QString baseTag = QStringLiteral("Dialogue.NewNode");
+        const QString newTag  = UniqueTagGlobal(m_loadedFiles, baseTag);
+
+        bool ok = false;
+        const QString tag = QInputDialog::getText(
+            this, QStringLiteral("Create Node"),
+            QStringLiteral("Tag:"), QLineEdit::Normal, newTag, &ok);
+        if (!ok || tag.trimmed().isEmpty()) return;
+
+        OghamSourceEntry entry;
+        entry.tag      = tag.trimmed();
+        entry.position = scenePos;
+        m_loadedFiles[targetFi].entries.append(entry);
+        const int newEi = m_loadedFiles[targetFi].entries.size() - 1;
+
+        SetFileDirty(targetFi, true);
+        RebuildTree();
+        RebuildGraph();
+        SelectEntry(targetFi, newEi);
+    }
+
+    // -------------------------------------------------------------------------
+    // Graph layout
+    // -------------------------------------------------------------------------
+
+    void OghamStoryteller::OnLayoutGraph()
+    {
+        // Build tag -> (fi, ei) lookup for all files
+        QMap<QString, QPair<int,int>> tagIndex;
+        for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
+            for (int ei = 0; ei < m_loadedFiles[fi].entries.size(); ++ei)
+            {
+                const QString& tag = m_loadedFiles[fi].entries[ei].tag;
+                if (!tag.isEmpty())
+                    tagIndex[tag] = {fi, ei};
+            }
+
+        // Build set of tags that are referenced by any option (have incoming edges)
+        QSet<QString> hasIncoming;
+        for (const auto& lf : m_loadedFiles)
+            for (const auto& entry : lf.entries)
+                for (const auto& opt : entry.options)
+                    if (!opt.targetTag.isEmpty())
+                        hasIncoming.insert(opt.targetTag);
+
+        // Collect start nodes (visible entries with no incoming edges), in file order
+        QList<QPair<int,int>> startNodes;
+        for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
+        {
+            if (!m_loadedFiles[fi].visible) continue;
+            for (int ei = 0; ei < m_loadedFiles[fi].entries.size(); ++ei)
+            {
+                const QString& tag = m_loadedFiles[fi].entries[ei].tag;
+                if (!tag.isEmpty() && !hasIncoming.contains(tag))
+                    startNodes.append({fi, ei});
+            }
+        }
+
+        // Fallback: all nodes are in cycles — treat every visible node as a start node
+        if (startNodes.isEmpty())
+        {
+            for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
+                if (m_loadedFiles[fi].visible)
+                    for (int ei = 0; ei < m_loadedFiles[fi].entries.size(); ++ei)
+                        startNodes.append({fi, ei});
+        }
+
+        const qreal colW    = OghamNodeItem::kNodeWidth + 80.0;
+        const qreal rowH    = 160.0;
+        const qreal treeGap = rowH * 0.5;
+
+        QSet<QString> visited;
+        qreal baseY = 0.0;
+
+        struct QueueEntry { int fi; int ei; int col; };
+
+        for (const auto& [sfi, sei] : startNodes)
+        {
+            const QString& startTag = m_loadedFiles[sfi].entries[sei].tag;
+            if (startTag.isEmpty() || visited.contains(startTag))
+                continue;
+
+            // BFS from this start node; assign columns (depth) and rows (stacking)
+            QList<QueueEntry> bfsQueue;
+            QSet<QString>     queued;
+            bfsQueue.append({sfi, sei, 0});
+            queued.insert(startTag);
+
+            QMap<int, int> nextRowPerCol;  // col -> next row index to assign
+            qreal treeMaxY = baseY;
+
+            while (!bfsQueue.isEmpty())
+            {
+                auto [fi, ei, col] = bfsQueue.takeFirst();
+                const QString& tag = m_loadedFiles[fi].entries[ei].tag;
+                if (tag.isEmpty() || visited.contains(tag)) continue;
+                visited.insert(tag);
+
+                const int  row = nextRowPerCol.value(col, 0);
+                nextRowPerCol[col] = row + 1;
+
+                const QPointF pos(col * colW, baseY + row * rowH);
+                m_loadedFiles[fi].entries[ei].position = pos;
+                treeMaxY = qMax(treeMaxY, pos.y() + rowH);
+
+                // Enqueue children (option targets not yet queued)
+                for (const auto& opt : m_loadedFiles[fi].entries[ei].options)
+                {
+                    if (opt.targetTag.isEmpty() || queued.contains(opt.targetTag)) continue;
+                    if (!tagIndex.contains(opt.targetTag)) continue;
+                    const auto& [cfi, cei] = tagIndex[opt.targetTag];
+                    queued.insert(opt.targetTag);
+                    bfsQueue.append({cfi, cei, col + 1});
+                }
+            }
+
+            baseY = treeMaxY + treeGap;
+        }
+
+        // Append any isolated / unreachable visible nodes below the laid-out trees
+        for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
+        {
+            if (!m_loadedFiles[fi].visible) continue;
+            for (int ei = 0; ei < m_loadedFiles[fi].entries.size(); ++ei)
+            {
+                const QString& tag = m_loadedFiles[fi].entries[ei].tag;
+                if (tag.isEmpty() || visited.contains(tag)) continue;
+                m_loadedFiles[fi].entries[ei].position = QPointF(0.0, baseY);
+                baseY += rowH;
+            }
+        }
+
+        for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
+            if (!m_loadedFiles[fi].entries.isEmpty())
+                SetFileDirty(fi, true);
+
+        RebuildGraph();
+        m_graphView->fitAll();
+    }
+
     // -------------------------------------------------------------------------
     // Form
     // -------------------------------------------------------------------------
@@ -1498,6 +2667,7 @@ namespace FoundationOgham
         }
 
         m_formStack->setCurrentIndex(1);
+        m_playFromNodeBtn->setEnabled(true);
         const OghamSourceEntry& entry = m_loadedFiles[fileIdx].entries[entryIdx];
 
         const QStringList oghamTags  = FetchKnownOghamTags();
@@ -1509,6 +2679,7 @@ namespace FoundationOgham
             cpl->setModel(m_tagCombo->model());
         m_tagCombo->setCurrentText(entry.tag);
         m_tagCombo->blockSignals(false);
+        m_renamedFromTag = entry.tag;
         ApplyTagStatus(m_tagStatus, entry.tag, oghamTags);
 
         // Wire status button to add-to-gptags if yellow
@@ -1536,7 +2707,9 @@ namespace FoundationOgham
     {
         m_selectedFileIdx  = -1;
         m_selectedEntryIdx = -1;
+        m_renamedFromTag.clear();
         m_formStack->setCurrentIndex(0);
+        m_playFromNodeBtn->setEnabled(false);
 
         m_tagCombo->blockSignals(true);
         m_tagCombo->clear();
@@ -1619,19 +2792,12 @@ namespace FoundationOgham
         cpl->setFilterMode(Qt::MatchContains);
         keyCombo->setCompleter(cpl);
 
-        // Value: single-line with overflow ellipsis in collapsed state
-        auto* valueEdit = new QLineEdit(currentValue, topRow);
-        valueEdit->setPlaceholderText("value");
-        valueEdit->setMinimumWidth(80);
-        valueEdit->setMaximumWidth(180);
-
         auto* toggleBtn = new QToolButton(topRow);
         toggleBtn->setFixedWidth(22);
         toggleBtn->setText("\xe2\x96\xbc"); // ▼
 
         hl->addWidget(statusBtn);
         hl->addWidget(keyCombo, 1);
-        hl->addWidget(valueEdit);
         hl->addWidget(toggleBtn);
 
         if (onRemove)
@@ -1644,13 +2810,13 @@ namespace FoundationOgham
         }
         outerV->addWidget(topRow);
 
-        // ── Expanded row: full-width multiline value edit ────────────────────
+        // ── Expanded row: full-width value edit (shown when ▼ is toggled) ────
         auto* expandRow  = new QWidget(outer);
         auto* expandHL   = new QHBoxLayout(expandRow);
         expandHL->setContentsMargins(26 + 4, 0, 0, 0);
         expandHL->setSpacing(0);
         auto* fullEdit = new QLineEdit(currentValue, expandRow);
-        fullEdit->setPlaceholderText("full value");
+        fullEdit->setPlaceholderText("value");
         expandHL->addWidget(fullEdit, 1);
         expandRow->setVisible(false);
         outerV->addWidget(expandRow);
@@ -1670,7 +2836,7 @@ namespace FoundationOgham
             }
             else if (hit)
             {
-                statusBtn->setText("\xe2\x9c\x93");
+                statusBtn->setText(QString(QChar(0x2713)));
                 statusBtn->setStyleSheet("color: #44aa44; font-weight: bold;");
                 statusBtn->setToolTip(QString("Key '%1' found in Lexicon.").arg(key));
                 statusBtn->setEnabled(false);
@@ -1690,34 +2856,33 @@ namespace FoundationOgham
 
         // ── Wire toggle ───────────────────────────────────────────────────────
         QObject::connect(toggleBtn, &QToolButton::clicked,
-            [expandRow, valueEdit, fullEdit, toggleBtn]()
+            [expandRow, toggleBtn]()
             {
                 const bool show = !expandRow->isVisible();
                 expandRow->setVisible(show);
                 toggleBtn->setText(show ? "\xe2\x96\xb2" : "\xe2\x96\xbc");
-                if (show)
-                    fullEdit->setText(valueEdit->text());
             });
 
-        // ── Wire key combo ────────────────────────────────────────────────────
+        // ── Wire key combo ─────────────────────────────────────────────────────
+        // Every keystroke: update status indicator only (no save — prevents focus stealing)
         QObject::connect(keyCombo, &QComboBox::editTextChanged,
-            [applyStatus, onKeyChanged](const QString& v)
+            [applyStatus](const QString& v) { applyStatus(v.trimmed()); });
+        // Commit (Enter / focus-loss / dropdown pick): update data model + save
+        QObject::connect(keyCombo->lineEdit(), &QLineEdit::editingFinished,
+            [keyCombo, onKeyChanged]()
             {
-                applyStatus(v.trimmed());
-                if (onKeyChanged) onKeyChanged(v.trimmed());
+                if (onKeyChanged) onKeyChanged(keyCombo->currentText().trimmed());
+            });
+        QObject::connect(keyCombo, QOverload<int>::of(&QComboBox::activated),
+            [keyCombo, onKeyChanged](int)
+            {
+                if (onKeyChanged) onKeyChanged(keyCombo->currentText().trimmed());
             });
 
-        // ── Wire value edits: both sync to each other and call onValueChanged ──
-        QObject::connect(valueEdit, &QLineEdit::editingFinished,
-            [valueEdit, fullEdit, onValueChanged]()
-            {
-                fullEdit->setText(valueEdit->text());
-                if (onValueChanged) onValueChanged(valueEdit->text());
-            });
+        // ── Wire value edit ────────────────────────────────────────────────────
         QObject::connect(fullEdit, &QLineEdit::editingFinished,
-            [valueEdit, fullEdit, onValueChanged]()
+            [fullEdit, onValueChanged]()
             {
-                valueEdit->setText(fullEdit->text());
                 if (onValueChanged) onValueChanged(fullEdit->text());
             });
 
@@ -1749,7 +2914,7 @@ namespace FoundationOgham
         }
 
         const QStringList& keys =
-            m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx].textKeys;
+            m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx].dataKeys;
 
         for (int i = 0; i < keys.size(); ++i)
         {
@@ -1761,7 +2926,7 @@ namespace FoundationOgham
             {
                 if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
                 auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                if (ci < e.textKeys.size()) e.textKeys[ci] = key;
+                if (ci < e.dataKeys.size()) e.dataKeys[ci] = key;
                 SetFileDirty(m_selectedFileIdx, true);
             };
 
@@ -1769,8 +2934,8 @@ namespace FoundationOgham
             {
                 if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
                 auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                if (ci >= e.textKeys.size()) return;
-                const QString& key = e.textKeys[ci];
+                if (ci >= e.dataKeys.size()) return;
+                const QString& key = e.dataKeys[ci];
                 if (key.isEmpty()) return;
                 WriteToDefaultLexicon(key, val, lexPaths);
                 FoundationLocalisation::LexiconEditorRequestBus::Broadcast(
@@ -1781,8 +2946,8 @@ namespace FoundationOgham
             {
                 if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
                 auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                if (ci >= e.textKeys.size()) return;
-                const QString& typed = e.textKeys[ci];
+                if (ci >= e.dataKeys.size()) return;
+                const QString& typed = e.dataKeys[ci];
                 const QString sugKey = IsValidTagStructure(typed) ? typed : QString{};
                 const QString sugVal = IsValidTagStructure(typed)
                     ? QString("[%1-TextKey%2]").arg(e.tag).arg(ci) : typed;
@@ -1793,9 +2958,9 @@ namespace FoundationOgham
             {
                 if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
                 auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                if (ci < e.textKeys.size())
+                if (ci < e.dataKeys.size())
                 {
-                    e.textKeys.removeAt(ci);
+                    e.dataKeys.removeAt(ci);
                     SetFileDirty(m_selectedFileIdx, true);
                     RebuildTextKeysArea();
                 }
@@ -1939,16 +3104,16 @@ namespace FoundationOgham
             targetSt->setFixedWidth(26);
             targetSt->setAutoRaise(true);
             // M: flag circular reference
-            if (!opt.targetEntry.isEmpty() && opt.targetEntry == currentEntryTag)
+            if (!opt.targetTag.isEmpty() && opt.targetTag == currentEntryTag)
             {
-                targetSt->setText("\xe2\x9c\x97");   // ✗
+                targetSt->setText(QString(QChar(0x2717)));   // ✗
                 targetSt->setStyleSheet("color: #cc3333; font-weight: bold;");
                 targetSt->setToolTip("Cannot target own entry (circular reference).");
                 targetSt->setEnabled(false);
             }
             else
             {
-                ApplyTagStatus(targetSt, opt.targetEntry, targetEntries, /*allowEmpty=*/true);
+                ApplyTagStatus(targetSt, opt.targetTag, targetEntries, /*allowEmpty=*/true);
             }
             targetRow->addWidget(targetSt);
 
@@ -1956,7 +3121,7 @@ namespace FoundationOgham
             targetCombo->setEditable(true);
             targetCombo->setInsertPolicy(QComboBox::NoInsert);
             targetCombo->addItems(targetEntries);
-            targetCombo->setCurrentText(opt.targetEntry);
+            targetCombo->setCurrentText(opt.targetTag);
             targetCombo->setPlaceholderText("target entry tag  (empty = end conversation)");
             auto* teCpl = new QCompleter(targetEntries, targetCombo);
             teCpl->setCaseSensitivity(Qt::CaseInsensitive);
@@ -2098,11 +3263,11 @@ namespace FoundationOgham
                 {
                     if (m_selectedFileIdx >= 0 && m_selectedEntryIdx >= 0) {
                         auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                        if (ci < e.options.size()) { e.options[ci].targetEntry = v; SetFileDirty(m_selectedFileIdx, true); } }
+                        if (ci < e.options.size()) { e.options[ci].targetTag = v; SetFileDirty(m_selectedFileIdx, true); } }
                     // M: detect circular reference
                     if (!v.isEmpty() && v == currentEntryTag)
                     {
-                        targetSt->setText("\xe2\x9c\x97");
+                        targetSt->setText(QString(QChar(0x2717)));
                         targetSt->setStyleSheet("color: #cc3333; font-weight: bold;");
                         targetSt->setToolTip("Cannot target own entry (circular reference).");
                         targetSt->setEnabled(false);
@@ -2414,6 +3579,18 @@ namespace FoundationOgham
         }
     }
 
+    void OghamStoryteller::TrySave()
+    {
+        if (m_isInteracting) return;
+        m_suppressWatcher = true;
+        for (int i = 0; i < m_loadedFiles.size(); ++i)
+        {
+            if (m_loadedFiles[i].dirty && SaveFile(i))
+                SetFileDirty(i, false);
+        }
+        m_suppressWatcher = false;
+    }
+
     void OghamStoryteller::SetFileDirty(int fileIdx, bool dirty)
     {
         if (fileIdx < 0 || fileIdx >= m_loadedFiles.size()) return;
@@ -2425,11 +3602,23 @@ namespace FoundationOgham
             auto* item = m_tree->topLevelItem(i);
             if (item->data(0, kRoleFileIdx).toInt() == fileIdx)
             {
-                QString fn = QFileInfo(m_loadedFiles[fileIdx].path).fileName();
-                item->setText(0, QString("%1%2").arg(fn).arg(dirty ? "  \u25CF" : ""));
+                const QString fn = QFileInfo(m_loadedFiles[fileIdx].path).fileName();
+                const QString label = QString("%1%2").arg(fn).arg(dirty ? "  \u25CF" : "");
+                if (QWidget* w = m_tree->itemWidget(item, 0))
+                {
+                    if (auto* lbl = w->findChild<QLabel*>("fileNameLabel"))
+                        lbl->setText(label);
+                }
+                else
+                {
+                    item->setText(0, label);
+                }
                 break;
             }
         }
+
+        if (dirty)
+            TrySave();
 
         UpdateStatusBar();
     }

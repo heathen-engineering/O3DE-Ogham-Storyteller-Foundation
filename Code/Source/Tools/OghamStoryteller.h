@@ -18,13 +18,21 @@
 #pragma once
 
 #if !defined(Q_MOC_RUN)
+#include <QColor>
 #include <QList>
+#include <QPointF>
 #include <QStringList>
+#include <QVector>
 #include <QWidget>
 #include <functional>
 #endif
 
+class QCloseEvent;
 class QComboBox;
+namespace FoundationOgham { class OghamAliasPinItem; }
+namespace FoundationOgham { class OghamGraphView;    }
+namespace FoundationOgham { class OghamNodeItem;     }
+namespace FoundationOgham { class OghamPlayPanel;    }
 class QDoubleSpinBox;
 class QLabel;
 class QLineEdit;
@@ -67,15 +75,27 @@ namespace FoundationOgham
     {
         QString                tag;
         QString                textKey;
-        QString                targetEntry;
+        QString                targetTag;
+        int                    targetAliasIndex = 0;
+        QVector<QPointF>       redirects;
         QList<OghamCondition>  conditions;
         QList<OghamOperation>  operations;
+    };
+
+    /// Graph-only pin that acts as a named destination alias for a node.
+    struct OghamAliasPin
+    {
+        QString  tag;
+        QPointF  position;
+        int      pinId = 0;
     };
 
     struct OghamSourceEntry
     {
         QString                  tag;
-        QStringList              textKeys;
+        QPointF                  position;
+        QStringList              dataKeys;
+        QList<OghamAliasPin>     aliasPins;
         QList<OghamSourceOption> options;
         QList<OghamOperation>    entryOperations;
     };
@@ -85,7 +105,9 @@ namespace FoundationOgham
     {
         QString                  path;
         QList<OghamSourceEntry>  entries;
-        bool                     dirty = false;
+        bool                     dirty      = false;
+        bool                     visible    = true;
+        QColor                   fileColor;  ///< invalid = use palette default
     };
 
     // =========================================================================
@@ -113,11 +135,14 @@ namespace FoundationOgham
 
     protected:
         void showEvent(QShowEvent* event) override;
+        void closeEvent(QCloseEvent* event) override;
 
     private slots:
         void OnNewFile();
         void OnSaveAll();
         void OnOpenSource();
+        void OnLayoutGraph();
+        void OnPlayFromNode();
         void OnTagEdited();
         void OnAddTextKey();
         void OnAddOption();
@@ -125,11 +150,12 @@ namespace FoundationOgham
     private:
         // ── File operations ──────────────────────────────────────────────────
         void    ScanAndLoadAll();
-        bool    ParseFile(const QString& path, QList<OghamSourceEntry>& out);
+        bool    ParseFile(const QString& path, LoadedFile& lf);
         bool    SaveFile(int fileIdx);
 
         // ── Tree building ────────────────────────────────────────────────────
         void     RebuildTree();
+        void     RebuildGraph();
         QWidget* MakeFileButtons(int fileIdx);
         QWidget* MakeEntryButtons(int fileIdx, int entryIdx,
                                    bool isReal, const QString& nodeTag);
@@ -140,6 +166,18 @@ namespace FoundationOgham
         void AddSiblingEntry(int fileIdx, const QString& siblingTag);
         void AddChildEntry  (int fileIdx, const QString& parentTag);
         void RemoveEntry    (int fileIdx, int entryIdx);
+        void MoveEntryToFile(int srcFi, int srcEi, int dstFi);
+
+        // ── Graph weld handlers ──────────────────────────────────────────────
+        void OnPinDroppedOnNode    (OghamNodeItem* src, int optIdx, OghamNodeItem* dst);
+        void OnPinDroppedOnAlias   (OghamNodeItem* src, int optIdx, OghamAliasPinItem* dst);
+        void OnPinDroppedOnCanvas  (OghamNodeItem* src, int optIdx, QPointF scenePos);
+        void OnDeleteNodeFromGraph (int fileIdx, int entryIdx);
+        void OnDeleteAliasPin      (int fileIdx, int entryIdx, int pinId);
+        void OnCreateAliasPin      (int fileIdx, int entryIdx, QPointF scenePos);
+        void OnCreateNodeFromCanvas(QPointF scenePos);
+        void OnDuplicateNode       (int fileIdx, int entryIdx);
+        void ApplyGraphVisibility();
 
         // ── Form ─────────────────────────────────────────────────────────────
         void PopulateForm(int fileIdx, int entryIdx);
@@ -148,6 +186,7 @@ namespace FoundationOgham
         void RebuildOptionsArea();
         void RebuildEntryOpsArea();
         void SetFileDirty(int fileIdx, bool dirty);
+        void TrySave();
         void UpdateStatusBar();
 
         // ── Condition/Operation row builders (shared) ─────────────────────────
@@ -181,9 +220,17 @@ namespace FoundationOgham
         void        ShowAddTagDialog(const QString& tag, QToolButton* btn);
 
         // ── Toolbar ──────────────────────────────────────────────────────────
-        QPushButton* m_newFileBtn  = nullptr;
-        QPushButton* m_saveAllBtn  = nullptr;
-        QPushButton* m_openSrcBtn  = nullptr;
+        QPushButton*    m_newFileBtn      = nullptr;
+        QPushButton*    m_saveAllBtn      = nullptr;
+        QPushButton*    m_openSrcBtn      = nullptr;
+        QPushButton*    m_layoutBtn       = nullptr;
+
+        // ── Form "Play from Node" button (RF-11) ─────────────────────────────
+        QPushButton*    m_playFromNodeBtn = nullptr;
+
+        // ── Main stack (editor page / play panel page) ────────────────────────
+        QStackedWidget*  m_mainStack  = nullptr;
+        OghamPlayPanel*  m_playPanel  = nullptr;
 
         // ── Tree (2 columns: name | buttons) ─────────────────────────────────
         QTreeWidget* m_tree = nullptr;
@@ -202,12 +249,17 @@ namespace FoundationOgham
         QVBoxLayout* m_optsLayout   = nullptr;
 
         // ── Status ───────────────────────────────────────────────────────────
-        QLabel*    m_statusLabel = nullptr;
-        QSplitter* m_splitter    = nullptr;
+        QLabel*    m_statusLabel    = nullptr;
+        QSplitter*      m_splitter      = nullptr;  ///< outer: tree | inner
+        QSplitter*      m_innerSplitter = nullptr;  ///< inner: graph | form
+        OghamGraphView* m_graphView     = nullptr;
 
         // ── File watcher ─────────────────────────────────────────────────────
         QFileSystemWatcher* m_fileWatcher    = nullptr;
         QTimer*             m_watchDebounce  = nullptr;
+
+        bool    m_suppressWatcher  = false; ///< block reload while we write
+        bool    m_isInteracting    = false; ///< true while node or pin is being dragged
 
         // ── Ogham tags file ───────────────────────────────────────────────────
         QString m_oghamTagsPath;
@@ -216,6 +268,7 @@ namespace FoundationOgham
         QList<LoadedFile> m_loadedFiles;
         int               m_selectedFileIdx  = -1;
         int               m_selectedEntryIdx = -1;
+        QString           m_renamedFromTag;  ///< stable tag when entry was last populated; used for rename propagation
     };
 
 } // namespace FoundationOgham

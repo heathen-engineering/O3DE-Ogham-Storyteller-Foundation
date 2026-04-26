@@ -282,9 +282,11 @@ namespace FoundationOgham
             if (entryVal.HasMember("parentTag") && entryVal["parentTag"].IsString())
                 entry.parentTag = HashTag(entryVal["parentTag"].GetString());
 
-            if (entryVal.HasMember("textKeys") && entryVal["textKeys"].IsArray())
+            // dataKeys is the current name; textKeys is the legacy fallback
+            const char* keysField = entryVal.HasMember("dataKeys") ? "dataKeys" : "textKeys";
+            if (entryVal.HasMember(keysField) && entryVal[keysField].IsArray())
             {
-                for (const auto& tk : entryVal["textKeys"].GetArray())
+                for (const auto& tk : entryVal[keysField].GetArray())
                 {
                     if (tk.IsString())
                         entry.textKeys.push_back(tk.GetString());
@@ -308,7 +310,10 @@ namespace FoundationOgham
                     if (optVal.HasMember("textKey") && optVal["textKey"].IsString())
                         opt.textKey = optVal["textKey"].GetString();
 
-                    if (optVal.HasMember("targetEntry") && optVal["targetEntry"].IsString())
+                    // targetTag is the current name; targetEntry is the legacy fallback
+                    if (optVal.HasMember("targetTag") && optVal["targetTag"].IsString())
+                        opt.targetEntry = HashTag(optVal["targetTag"].GetString());
+                    else if (optVal.HasMember("targetEntry") && optVal["targetEntry"].IsString())
                         opt.targetEntry = HashTag(optVal["targetEntry"].GetString());
 
                     if (optVal.HasMember("conditions"))
