@@ -10,6 +10,9 @@ An [Open 3D Engine (O3DE)](https://o3de.org) gem providing a data-driven narrati
 - **Platforms:** Windows, Linux, Android, iOS
 
 ---
+<img width="2591" height="1440" alt="image" src="https://github.com/user-attachments/assets/396ae4fc-7aa2-4305-bf36-9b823f1076a7" />
+
+---
 
 ## Requirements
 
