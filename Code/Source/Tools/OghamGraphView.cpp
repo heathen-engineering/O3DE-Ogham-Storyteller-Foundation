@@ -71,14 +71,12 @@ namespace FoundationOgham
         const qreal right = qCeil(rect.right()   / kGridMinor) * kGridMinor;
         const qreal bot   = qCeil(rect.bottom()  / kGridMinor) * kGridMinor;
 
-        // Major grid lines (subtle)
         painter->setPen(QPen(QColor(0x2e, 0x2e, 0x2e), 1.0));
         for (qreal x = qFloor(rect.left() / kGridMajor) * kGridMajor; x <= rect.right(); x += kGridMajor)
             painter->drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()));
         for (qreal y = qFloor(rect.top() / kGridMajor) * kGridMajor; y <= rect.bottom(); y += kGridMajor)
             painter->drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y));
 
-        // Minor grid dots
         painter->setPen(QPen(QColor(0x2a, 0x2a, 0x2a), 1.0));
         for (qreal x = left; x <= right; x += kGridMinor)
             for (qreal y = top; y <= bot; y += kGridMinor)
@@ -86,14 +84,18 @@ namespace FoundationOgham
     }
 
     // -------------------------------------------------------------------------
-    // Pan
+    // Mouse press
     // -------------------------------------------------------------------------
 
     void OghamGraphView::mousePressEvent(QMouseEvent* event)
     {
-        const bool isMiddle = (event->button() == Qt::MiddleButton);
-        const bool isLeft   = (event->button() == Qt::LeftButton);
+        // Middle mouse: consume silently — no rubber-band, no pan
+        if (event->button() == Qt::MiddleButton) { event->accept(); return; }
 
+        const bool isLeft  = (event->button() == Qt::LeftButton);
+        const bool isRight = (event->button() == Qt::RightButton);
+
+        // ── Left: pin drag detection ──────────────────────────────────────────
         if (isLeft)
         {
             if (auto* node = dynamic_cast<OghamNodeItem*>(itemAt(event->pos())))
@@ -113,13 +115,22 @@ namespace FoundationOgham
                     return;
                 }
             }
+
+            // Left-click on empty canvas → rubber-band will start
+            if (!m_scene->itemAt(mapToScene(event->pos()), QTransform()))
+            {
+                m_rubberBanding = true;
+                emit rubberBandStarted();
+            }
         }
 
-        if (isMiddle)
+        // ── Right: begin potential pan (confirmed after threshold drag) ────────
+        if (isRight)
         {
-            m_panning    = true;
-            m_lastPanPos = event->pos();
-            setCursor(Qt::ClosedHandCursor);
+            m_rightPressPos = event->pos();
+            m_rightDragged  = false;
+            m_rightPanning  = false;
+            // Accept the press so we can track it; contextMenuEvent handles the menu
             event->accept();
             return;
         }
@@ -127,8 +138,13 @@ namespace FoundationOgham
         QGraphicsView::mousePressEvent(event);
     }
 
+    // -------------------------------------------------------------------------
+    // Mouse move
+    // -------------------------------------------------------------------------
+
     void OghamGraphView::mouseMoveEvent(QMouseEvent* event)
     {
+        // ── Pin drag ──────────────────────────────────────────────────────────
         if (m_pinDragging && m_pinDragLine)
         {
             if (!m_pinDragNode || !m_pinDragNode->scene()) { m_pinDragging = false; return; }
@@ -143,12 +159,26 @@ namespace FoundationOgham
             return;
         }
 
-        if (m_panning)
+        // ── Right-button pan ──────────────────────────────────────────────────
+        if (event->buttons() & Qt::RightButton)
         {
-            const QPoint delta = event->pos() - m_lastPanPos;
-            m_lastPanPos = event->pos();
-            horizontalScrollBar()->setValue(horizontalScrollBar()->value() - delta.x());
-            verticalScrollBar()->setValue(verticalScrollBar()->value()     - delta.y());
+            const QPoint delta = event->pos() - m_rightPressPos;
+            if (!m_rightPanning && delta.manhattanLength() > kPanThreshold)
+            {
+                m_rightPanning = true;
+                m_rightDragged = true;
+                m_lastPanPos   = event->pos();
+                setCursor(Qt::ClosedHandCursor);
+            }
+            if (m_rightPanning)
+            {
+                const QPoint panDelta = event->pos() - m_lastPanPos;
+                m_lastPanPos = event->pos();
+                horizontalScrollBar()->setValue(horizontalScrollBar()->value() - panDelta.x());
+                verticalScrollBar()->setValue(verticalScrollBar()->value()     - panDelta.y());
+                event->accept();
+                return;
+            }
             event->accept();
             return;
         }
@@ -156,8 +186,13 @@ namespace FoundationOgham
         QGraphicsView::mouseMoveEvent(event);
     }
 
+    // -------------------------------------------------------------------------
+    // Mouse release
+    // -------------------------------------------------------------------------
+
     void OghamGraphView::mouseReleaseEvent(QMouseEvent* event)
     {
+        // ── Pin drag end ──────────────────────────────────────────────────────
         if (m_pinDragging && event->button() == Qt::LeftButton)
         {
             m_pinDragging = false;
@@ -196,10 +231,44 @@ namespace FoundationOgham
             return;
         }
 
-        if (m_panning && event->button() == Qt::MiddleButton)
+        // ── Rubber-band end ───────────────────────────────────────────────────
+        if (event->button() == Qt::LeftButton && m_rubberBanding)
         {
-            m_panning = false;
-            setCursor(Qt::ArrowCursor);
+            m_rubberBanding = false;
+            emit rubberBandEnded();
+        }
+
+        // ── Right-button release ──────────────────────────────────────────────
+        if (event->button() == Qt::RightButton)
+        {
+            if (m_rightPanning)
+            {
+                m_rightPanning = false;
+                unsetCursor();
+            }
+            if (!m_rightDragged)
+            {
+                // Show context menu here rather than contextMenuEvent — on X11 that
+                // event fires on press (before any drag), so we suppress it entirely
+                // and handle the menu ourselves on release.
+                const QPointF scenePos = mapToScene(event->pos());
+                if (m_scene->itemAt(scenePos, QTransform()) == nullptr)
+                {
+                    QMenu menu(this);
+                    menu.addAction(QStringLiteral("Create Node Here"), [this, scenePos]()
+                    {
+                        emit createNodeRequested(scenePos);
+                    });
+                    menu.exec(event->globalPos());
+                }
+                else
+                {
+                    QContextMenuEvent fakeEvt(QContextMenuEvent::Mouse,
+                                             event->pos(), event->globalPos());
+                    QGraphicsView::contextMenuEvent(&fakeEvt);
+                }
+            }
+            m_rightDragged = false;
             event->accept();
             return;
         }
@@ -230,7 +299,7 @@ namespace FoundationOgham
     }
 
     // -------------------------------------------------------------------------
-    // Keyboard — "F" to fit
+    // Keyboard — Delete (batch), F to fit
     // -------------------------------------------------------------------------
 
     void OghamGraphView::keyPressEvent(QKeyEvent* event)
@@ -245,24 +314,27 @@ namespace FoundationOgham
 
         if (event->key() == Qt::Key_Delete)
         {
-            bool handled = false;
+            // Snapshot selection BEFORE emitting any signal (signals trigger RebuildGraph
+            // which clears the scene, making the list stale).
+            QList<QPair<int,int>>              nodePairs;
+            QList<QPair<QPair<int,int>,int>>   aliasPins;
 
-            // RF-K-1: delete selected nodes and alias pins
             for (QGraphicsItem* item : m_scene->selectedItems())
             {
                 if (auto* node = dynamic_cast<OghamNodeItem*>(item))
-                {
-                    emit deleteNodeRequested(node->fileIdx(), node->entryIdx());
-                    handled = true;
-                }
+                    nodePairs.append({node->fileIdx(), node->entryIdx()});
                 else if (auto* alias = dynamic_cast<OghamAliasPinItem*>(item))
-                {
-                    emit deleteAliasPinRequested(alias->fileIdx(), alias->entryIdx(), alias->pinId());
-                    handled = true;
-                }
+                    aliasPins.append({{alias->fileIdx(), alias->entryIdx()}, alias->pinId()});
             }
 
-            // RF-K-2: remove hovered redirect on any connection (only if no node was deleted)
+            bool handled = !nodePairs.isEmpty() || !aliasPins.isEmpty();
+
+            if (!nodePairs.isEmpty())
+                emit deleteNodesRequested(nodePairs);
+            if (!aliasPins.isEmpty())
+                emit deleteAliasPinsRequested(aliasPins);
+
+            // Fallback: remove hovered redirect on any connection (only if no node deleted)
             if (!handled)
             {
                 for (QGraphicsItem* item : m_scene->items())
@@ -284,6 +356,19 @@ namespace FoundationOgham
         }
 
         QGraphicsView::keyPressEvent(event);
+    }
+
+    // -------------------------------------------------------------------------
+    // Context menu — right-click on canvas (only fires when not dragging)
+    // -------------------------------------------------------------------------
+
+    void OghamGraphView::contextMenuEvent(QContextMenuEvent* event)
+    {
+        // Always suppress the platform context-menu event.  On X11 this fires on
+        // right-button PRESS (before any mouseMoveEvent can establish a drag), so
+        // letting it through would show the menu immediately and prevent panning.
+        // Context menu display is driven manually from mouseReleaseEvent instead.
+        event->accept();
     }
 
     // -------------------------------------------------------------------------
@@ -309,27 +394,6 @@ namespace FoundationOgham
             bounds = bounds.united(item->mapToScene(item->boundingRect()).boundingRect());
         if (bounds.isNull()) { fitAll(); return; }
         fitInView(bounds.adjusted(-60, -60, 60, 60), Qt::KeepAspectRatio);
-    }
-
-    // -------------------------------------------------------------------------
-    // Context menu — right-click on empty canvas
-    // -------------------------------------------------------------------------
-
-    void OghamGraphView::contextMenuEvent(QContextMenuEvent* event)
-    {
-        const QPointF scenePos = mapToScene(event->pos());
-        if (m_scene->itemAt(scenePos, QTransform()) == nullptr)
-        {
-            QMenu menu(this);
-            menu.addAction(QStringLiteral("Create Node Here"), [this, scenePos]()
-            {
-                emit createNodeRequested(scenePos);
-            });
-            menu.exec(event->globalPos());
-            event->accept();
-            return;
-        }
-        QGraphicsView::contextMenuEvent(event);
     }
 
 } // namespace FoundationOgham

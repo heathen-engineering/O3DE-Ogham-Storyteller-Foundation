@@ -21,6 +21,8 @@
 #include <QGraphicsObject>
 #include <QPainterPath>
 #include <QPointF>
+#include <QRectF>
+#include <QString>
 #include <QVector>
 #include <functional>
 #endif
@@ -32,16 +34,19 @@ namespace FoundationOgham
     // =========================================================================
     // OghamConnectionItem
     //
-    // A directed bezier edge from one node's output pin to any input pin
-    // (either another node's body pin, or an alias pin).
+    // A directed edge from one node's output pin to any input pin.
+    // Renders in one of two modes:
     //
-    // The source is always an OghamNodeItem output pin.
-    // The destination is resolved via getDstPos — a callable that returns
-    // the current scene position of the destination pin.
+    //  Wire mode  — cubic bezier from output pin to destination input pin,
+    //               with optional redirect waypoints.
+    //
+    //  Tab mode   — a flag-shaped label anchored at the source output pin,
+    //               showing the destination tag. The bezier wire is hidden.
+    //               Right-click "Show as Tab" / "Show as Wire" toggles modes.
+    //               Left-click on the tab selects the target node.
+    //               Hover expands the label to show the full target tag.
     //
     // The item lives at scene origin so scene coords == local coords.
-    // The constructor wires src movement internally; the caller is responsible
-    // for connecting the dst movement signal to refreshPath().
     // =========================================================================
     class OghamConnectionItem : public QGraphicsObject
     {
@@ -52,8 +57,11 @@ namespace FoundationOgham
                                      int                              optionIdx,
                                      std::function<QPointF()>         getDstPos,
                                      const QVector<QPointF>&          redirects,
-                                     int                              dstFileIdx = -1,
-                                     QGraphicsItem*                   parent = nullptr);
+                                     const QString&                   targetTag,
+                                     bool                             displayAsTab    = false,
+                                     int                              dstFileIdx      = -1,
+                                     const QColor&                    dstHighlight    = QColor(),
+                                     QGraphicsItem*                   parent          = nullptr);
 
         int srcFileIdx() const;
         int dstFileIdx() const { return m_dstFileIdx; }
@@ -73,6 +81,10 @@ namespace FoundationOgham
     signals:
         /// Emitted after a waypoint is added, moved, or removed.
         void redirectsChanged(QVector<QPointF> redirects);
+        /// Emitted when the user toggles wire ↔ tab mode via the context menu.
+        void displayModeChanged(bool displayAsTab);
+        /// Emitted when the user left-clicks the tab; caller should select the target node.
+        void tabClicked(const QString& targetTag);
 
     public slots:
         void refreshPath();
@@ -91,17 +103,33 @@ namespace FoundationOgham
                                       const QVector<QPointF>& redirects);
         static int          redirectInsertIndex(const QVector<QPointF>& pts, QPointF click);
 
+        void    paintTab(QPainter* painter) const;
+        QRectF  tabRect()                   const;
+
         OghamNodeItem*           m_srcNode;
         int                      m_optionIdx;
         std::function<QPointF()> m_getDstPos;
         QVector<QPointF>         m_redirects;
         QPainterPath             m_path;
         int                      m_dstFileIdx;
-        int                      m_draggingIdx = -1; ///< redirect index being dragged, -1 = none
-        int                      m_hoverIdx    = -1; ///< redirect index under cursor, -1 = none
+        int                      m_draggingIdx = -1;
+        int                      m_hoverIdx    = -1;
+
+        // Tab mode state
+        QString m_targetTag;
+        bool    m_displayAsTab = false;
+        bool    m_tabHovered   = false;
+        qreal   m_savedZValue  = 0.0;
+        QPointF m_tabPos;
+        QColor  m_dstHighlight;   ///< destination node's highlight color; invalid = use default tab color
 
         static constexpr qreal kRedirectRadius    = 4.0;
-        static constexpr qreal kRedirectHitRadius = 8.0; ///< grab radius for waypoints
+        static constexpr qreal kRedirectHitRadius = 8.0;
+        static constexpr qreal kTabHeight         = 18.0;
+        static constexpr qreal kTabArrow          = 7.0;  ///< horizontal width of the chevron tip
+        static constexpr qreal kTabPadX           = 5.0;  ///< horizontal text padding inside tab
+        static constexpr qreal kTabDefaultW       = 27.0;   // 1/3 of original 80
+        static constexpr qreal kTabHoverW         = 60.0;   // 1/3 of original 180
     };
 
 } // namespace FoundationOgham

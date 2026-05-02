@@ -19,6 +19,8 @@
 
 #if !defined(Q_MOC_RUN)
 #include <QGraphicsView>
+#include <QList>
+#include <QPair>
 #include <QPoint>
 #include <QPointF>
 #endif
@@ -36,7 +38,7 @@ namespace FoundationOgham
     //
     // QGraphicsView subclass providing the node graph canvas.
     //
-    //   Pan  — left-drag on empty canvas, or middle-drag anywhere
+    //   Pan  — right-drag on canvas (right-click without drag shows context menu)
     //   Zoom — mouse wheel (clamped 10% – 500%)
     //   Fit  — "F" key: fit selection (or all items if nothing selected)
     //   Grid — subtle dot grid drawn in scene coordinates
@@ -57,16 +59,23 @@ namespace FoundationOgham
         void pinDroppedOnNode(OghamNodeItem* src, int optionIdx, OghamNodeItem* dst);
         void pinDroppedOnAlias(OghamNodeItem* src, int optionIdx, OghamAliasPinItem* dst);
         void pinDroppedOnCanvas(OghamNodeItem* src, int optionIdx, QPointF scenePos);
-        /// Emitted when Delete is pressed while a node is selected (RF-K-1).
+        /// Emitted when Delete is pressed while a single node is selected.
         void deleteNodeRequested(int fileIdx, int entryIdx);
         /// Emitted when Delete is pressed on a selected alias pin.
         void deleteAliasPinRequested(int fileIdx, int entryIdx, int pinId);
+        /// Batch delete: emitted when multiple nodes/alias-pins need removing.
+        void deleteNodesRequested(QList<QPair<int,int>> fileEntryPairs);
+        void deleteAliasPinsRequested(QList<QPair<QPair<int,int>,int>> pinItems);
         /// Emitted when the user starts dragging an output pin (before drop).
         void pinDragStarted();
         /// Emitted just before the drop signal fires, so interacting state can clear.
         void pinDragEnded();
-        /// Emitted when the user right-clicks on empty canvas.
+        /// Emitted when the user right-clicks on empty canvas without dragging.
         void createNodeRequested(QPointF scenePos);
+        /// Emitted when rubber-band selection starts (left-drag on empty canvas).
+        void rubberBandStarted();
+        /// Emitted when the rubber-band selection gesture ends.
+        void rubberBandEnded();
 
     protected:
         void drawBackground(QPainter* painter, const QRectF& rect) override;
@@ -79,12 +88,21 @@ namespace FoundationOgham
 
     private:
         QGraphicsScene*    m_scene       = nullptr;
-        bool               m_panning     = false;
-        QPoint             m_lastPanPos;
-        bool               m_pinDragging = false;
-        OghamNodeItem*     m_pinDragNode = nullptr;
-        int                m_pinDragOpt  = -1;
-        QGraphicsPathItem* m_pinDragLine = nullptr;
+
+        // ── Left-button state ────────────────────────────────────────────────
+        bool               m_pinDragging  = false;
+        OghamNodeItem*     m_pinDragNode  = nullptr;
+        int                m_pinDragOpt   = -1;
+        QGraphicsPathItem* m_pinDragLine  = nullptr;
+        bool               m_rubberBanding = false;  ///< left-drag on empty canvas
+
+        // ── Right-button pan state ───────────────────────────────────────────
+        bool               m_rightPanning  = false;  ///< currently panning
+        bool               m_rightDragged  = false;  ///< moved > threshold during right press
+        QPoint             m_rightPressPos;           ///< where right button went down
+        QPoint             m_lastPanPos;              ///< last pan cursor position
+
+        static constexpr int kPanThreshold = 5;  ///< pixels before right-drag becomes a pan
     };
 
 } // namespace FoundationOgham

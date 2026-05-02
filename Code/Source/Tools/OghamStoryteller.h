@@ -20,6 +20,7 @@
 #if !defined(Q_MOC_RUN)
 #include <QColor>
 #include <QList>
+#include <QPair>
 #include <QPointF>
 #include <QStringList>
 #include <QVector>
@@ -28,23 +29,19 @@
 #endif
 
 class QCloseEvent;
-class QComboBox;
 namespace FoundationOgham { class OghamAliasPinItem; }
 namespace FoundationOgham { class OghamGraphView;    }
 namespace FoundationOgham { class OghamNodeItem;     }
 namespace FoundationOgham { class OghamPlayPanel;    }
-class QDoubleSpinBox;
 class QLabel;
 class QLineEdit;
 class QPushButton;
-class QScrollArea;
 class QSplitter;
 class QStackedWidget;
 class QTimer;
 class QToolButton;
 class QTreeWidget;
 class QTreeWidgetItem;
-class QVBoxLayout;
 class QFileSystemWatcher;
 
 namespace FoundationOgham
@@ -77,6 +74,7 @@ namespace FoundationOgham
         QString                textKey;
         QString                targetTag;
         int                    targetAliasIndex = 0;
+        bool                   displayAsTab     = false; ///< render as flag-tab instead of bezier wire
         QVector<QPointF>       redirects;
         QList<OghamCondition>  conditions;
         QList<OghamOperation>  operations;
@@ -90,6 +88,14 @@ namespace FoundationOgham
         int      pinId = 0;
     };
 
+    /// Author label for organising nodes — editor-only, not written to compiled output.
+    struct OghamLabel
+    {
+        int     id    = 0;
+        QColor  color;
+        QString name;
+    };
+
     struct OghamSourceEntry
     {
         QString                  tag;
@@ -98,6 +104,8 @@ namespace FoundationOgham
         QList<OghamAliasPin>     aliasPins;
         QList<OghamSourceOption> options;
         QList<OghamOperation>    entryOperations;
+        QList<int>               labelIds;      ///< IDs of OghamLabels assigned to this node
+        QColor                   highlightColor; ///< node border color; invalid = none
     };
 
     /// One loaded .ogmcon file with its entries and dirty flag.
@@ -143,9 +151,8 @@ namespace FoundationOgham
         void OnOpenSource();
         void OnLayoutGraph();
         void OnPlayFromNode();
-        void OnTagEdited();
-        void OnAddTextKey();
-        void OnAddOption();
+        void OnSnapToggle();
+        void OnTreeSearch(const QString& text);
 
     private:
         // ── File operations ──────────────────────────────────────────────────
@@ -173,41 +180,53 @@ namespace FoundationOgham
         void OnPinDroppedOnAlias   (OghamNodeItem* src, int optIdx, OghamAliasPinItem* dst);
         void OnPinDroppedOnCanvas  (OghamNodeItem* src, int optIdx, QPointF scenePos);
         void OnDeleteNodeFromGraph (int fileIdx, int entryIdx);
+        void OnDeleteNodesFromGraph(QList<QPair<int,int>> fileEntryPairs);
         void OnDeleteAliasPin      (int fileIdx, int entryIdx, int pinId);
         void OnCreateAliasPin      (int fileIdx, int entryIdx, QPointF scenePos);
         void OnCreateNodeFromCanvas(QPointF scenePos);
         void OnDuplicateNode       (int fileIdx, int entryIdx);
+        void OnCascadeFromNode     (int fileIdx, int entryIdx, QPoint screenPos);
         void ApplyGraphVisibility();
 
-        // ── Form ─────────────────────────────────────────────────────────────
-        void PopulateForm(int fileIdx, int entryIdx);
-        void ClearForm();
-        void RebuildTextKeysArea();
-        void RebuildOptionsArea();
-        void RebuildEntryOpsArea();
+        // ── Selection tracking (form panel removed; indices kept for play + modals) ──
+        void PopulateForm(int fileIdx, int entryIdx);  ///< just updates indices + play button
+        void ClearForm();                               ///< clears indices + play button
         void SetFileDirty(int fileIdx, bool dirty);
-        void TrySave();
         void UpdateStatusBar();
-
-        // ── Condition/Operation row builders (shared) ─────────────────────────
-        /// Append one condition row into the given VBoxLayout. condList is the live
-        /// list of conditions that backs the row (shared ref path).
-        using CondList = QList<OghamCondition>;
-        using OpList   = QList<OghamOperation>;
-        QWidget* MakeConditionRow(int ci,
-                                  std::function<CondList&()> getList,
-                                  std::function<void()>      onChanged,
-                                  const QStringList&         knownTags,
-                                  bool                       isLast = false);
-        QWidget* MakeOperationRow(int oi,
-                                  std::function<OpList&()>  getList,
-                                  std::function<void()>     onChanged,
-                                  const QStringList&        knownTags);
 
         // ── Lexicon helpers ──────────────────────────────────────────────────
         QStringList FetchKnownLexiconKeys() const;
         QString     FetchLexiconValueForKey(const QString& key) const;
+        QString     FindPrimaryLexiconPath() const;
+        bool        WriteLexiconEntry(const QString& key, const QString& value);
         void        ShowAddKeyDialog(const QString& key, const QString& value);
+
+        // ── Inline field editing (invoked via node hover-reveal buttons) ──────
+        void ShowLexiconFieldModal(int fileIdx, int entryIdx, int rowIdx, QPoint screenPos);
+        void AddDataKey   (int fileIdx, int entryIdx, QPoint screenPos);
+        void RemoveDataKey(int fileIdx, int entryIdx, int rowIdx);
+
+        void ShowOperationModal  (int fileIdx, int entryIdx, int row, QPoint screenPos);
+        void AddEntryOperation   (int fileIdx, int entryIdx, QPoint screenPos);
+        void RemoveEntryOperation(int fileIdx, int entryIdx, int row);
+
+        void ShowOptionModal  (int fileIdx, int entryIdx, int row, QPoint screenPos);
+        void AddEntryOption   (int fileIdx, int entryIdx, QPoint screenPos);
+        void RemoveEntryOption(int fileIdx, int entryIdx, int row);
+
+        // ── Label management ─────────────────────────────────────────────────
+        void LoadGraphMeta();
+        void SaveGraphMeta();
+        void ShowLabelModal(int fileIdx, int entryIdx, QPoint screenPos);
+        void ShowHighlightColorPicker(int fileIdx, int entryIdx);
+
+        // ── Graph alignment tools ─────────────────────────────────────────────
+        void AlignSelected(int mode);
+
+        // ── Tag rename propagation ────────────────────────────────────────────
+        int PropagateTagRename(const QString& oldTag, const QString& newTag,
+                               int srcFi, int srcEi);
+        int CascadeDescendantRename(const QString& oldPrefix, const QString& newPrefix);
 
         // ── Ogham tag helpers ─────────────────────────────────────────────────
         void        EnsureOghamTagsFile();
@@ -224,9 +243,11 @@ namespace FoundationOgham
         QPushButton*    m_saveAllBtn      = nullptr;
         QPushButton*    m_openSrcBtn      = nullptr;
         QPushButton*    m_layoutBtn       = nullptr;
+        QPushButton*    m_snapBtn         = nullptr;
+        QPushButton*    m_playFromNodeBtn = nullptr;  ///< in toolbar (no form panel)
 
-        // ── Form "Play from Node" button (RF-11) ─────────────────────────────
-        QPushButton*    m_playFromNodeBtn = nullptr;
+        // ── Tree search ───────────────────────────────────────────────────────
+        QLineEdit*      m_treeSearch      = nullptr;
 
         // ── Main stack (editor page / play panel page) ────────────────────────
         QStackedWidget*  m_mainStack  = nullptr;
@@ -235,31 +256,23 @@ namespace FoundationOgham
         // ── Tree (2 columns: name | buttons) ─────────────────────────────────
         QTreeWidget* m_tree = nullptr;
 
-        // ── Right panel ──────────────────────────────────────────────────────
-        QStackedWidget* m_formStack  = nullptr;  // page 0=empty, page 1=form
-
-        // Form fields (page 1)
-        QComboBox*   m_tagCombo      = nullptr;
-        QToolButton* m_tagStatus     = nullptr;
-        QWidget*     m_keysWidget   = nullptr;
-        QVBoxLayout* m_keysLayout   = nullptr;
-        QWidget*     m_entOpsWidget = nullptr;
-        QVBoxLayout* m_entOpsLayout = nullptr;
-        QWidget*     m_optsWidget   = nullptr;
-        QVBoxLayout* m_optsLayout   = nullptr;
-
         // ── Status ───────────────────────────────────────────────────────────
-        QLabel*    m_statusLabel    = nullptr;
-        QSplitter*      m_splitter      = nullptr;  ///< outer: tree | inner
-        QSplitter*      m_innerSplitter = nullptr;  ///< inner: graph | form
-        OghamGraphView* m_graphView     = nullptr;
+        QLabel*         m_statusLabel = nullptr;
+        QSplitter*      m_splitter    = nullptr;  ///< tree | graph
+        OghamGraphView* m_graphView   = nullptr;
+
+        // ── Graph labels (editor-only metadata) ──────────────────────────────
+        QList<OghamLabel> m_graphLabels;
+        QString           m_graphMetaPath;
 
         // ── File watcher ─────────────────────────────────────────────────────
         QFileSystemWatcher* m_fileWatcher    = nullptr;
         QTimer*             m_watchDebounce  = nullptr;
 
-        bool    m_suppressWatcher  = false; ///< block reload while we write
-        bool    m_isInteracting    = false; ///< true while node or pin is being dragged
+        bool    m_suppressWatcher      = false; ///< block reload while we write
+        bool    m_isInteracting        = false; ///< true while node or pin is being dragged
+        bool    m_suppressFormOnSelect = false; ///< true during rubber-band, skip form updates
+        bool    m_snapToGrid           = false;
 
         // ── Ogham tags file ───────────────────────────────────────────────────
         QString m_oghamTagsPath;

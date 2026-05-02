@@ -27,6 +27,9 @@
 
 #include <FoundationLocalisation/LexiconEditorRequestBus.h>
 
+#include <QApplication>
+#include <QCheckBox>
+#include <QScreen>
 #include <QCloseEvent>
 #include <QColorDialog>
 #include <QComboBox>
@@ -48,7 +51,9 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFileSystemWatcher>
+#include <QEvent>
 #include <QFormLayout>
+#include <QKeyEvent>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -70,6 +75,7 @@
 #include <QInputDialog>
 #include <QStackedWidget>
 #include <QTableWidget>
+#include <QTextEdit>
 #include <QTreeWidget>
 #include <QUrl>
 #include <QVBoxLayout>
@@ -151,6 +157,8 @@ namespace FoundationOgham
 
             auto* buttons = new QDialogButtonBox(
                 QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+            if (auto* ok = buttons->button(QDialogButtonBox::Ok))
+                { ok->setAutoDefault(false); ok->setDefault(false); }
             layout->addWidget(buttons);
 
             connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
@@ -183,6 +191,977 @@ namespace FoundationOgham
     };
 
     // =========================================================================
+    // Modal shared helpers — forward-declared so modals can use them.
+    // Definitions are further down in this file.
+    // =========================================================================
+
+    static bool     IsValidTagStructure(const QString& tag);
+    static void     ApplyTagStatus(QToolButton* btn, const QString& tag,
+                                   const QStringList& knownTags, bool allowEmpty = false);
+    static QPoint   ModalPos(QPoint screenPos, const QDialog& dlg);
+
+    // Node-style + / × buttons used in all inline modals
+    static QPushButton* makeAddBtn(QWidget* p)
+    {
+        auto* b = new QPushButton("+", p);
+        b->setFixedSize(16, 16);
+        b->setStyleSheet(
+            "QPushButton{background:#286828;color:#e8e8e8;border-radius:2px;"
+            "font-weight:bold;border:none;padding:0}"
+            "QPushButton:hover{background:#38a838}");
+        return b;
+    }
+    static QPushButton* makeRemoveBtn(QWidget* p)
+    {
+        auto* b = new QPushButton("\xc3\x97", p);
+        b->setFixedSize(14, 14);
+        b->setStyleSheet(
+            "QPushButton{background:#782828;color:#e8e8e8;border-radius:2px;"
+            "font-weight:bold;border:none;padding:0}"
+            "QPushButton:hover{background:#a83838}");
+        return b;
+    }
+
+    static const QStringList kModalComparisons = {
+        "Exists","NotExists","Equal","NotEqual","Less","LessEqual","Greater","GreaterEqual"};
+    static const QStringList kModalArithmetics = {
+        "Set","Add","Sub","Mul","Div","Min","Max"};
+    static const QStringList kModalLogicOps = {"And","Or","Xor"};
+    static bool kModalIsNumeric(const QString& cmp)
+    { return cmp != "Exists" && cmp != "NotExists"; }
+
+    // =========================================================================
+    // LexiconFieldModal — inline editor for a single data-key row
+    // =========================================================================
+
+    class LexiconFieldModal : public QDialog
+    {
+    public:
+        enum class Action { None, Assign, Create, Update };
+        struct Result { Action action = Action::None; QString key; QString value; };
+
+        LexiconFieldModal(
+            const QString&     originalKey,
+            const QStringList& knownKeys,
+            std::function<QString(const QString&)> fetchValue,
+            QWidget*           parent = nullptr)
+            : QDialog(parent, Qt::Popup | Qt::FramelessWindowHint)
+            , m_originalKey(originalKey)
+            , m_originalValue(fetchValue(originalKey))
+            , m_fetchValue(std::move(fetchValue))
+        {
+            setMinimumWidth(380);
+            auto* vl = new QVBoxLayout(this);
+            vl->setSpacing(8);
+            vl->setContentsMargins(12, 12, 12, 12);
+
+            auto* form = new QFormLayout();
+            form->setSpacing(6);
+
+            // Key — editable combo with existing lexicon keys (no label)
+            m_keyCombo = new QComboBox(this);
+            m_keyCombo->setEditable(true);
+            m_keyCombo->setInsertPolicy(QComboBox::NoInsert);
+            m_keyCombo->addItems(knownKeys);
+            m_keyCombo->setCurrentText(originalKey);
+            m_keyCombo->setPlaceholderText("Localisation key\xe2\x80\xa6");
+            auto* cpl = new QCompleter(knownKeys, m_keyCombo);
+            cpl->setCaseSensitivity(Qt::CaseInsensitive);
+            cpl->setFilterMode(Qt::MatchContains);
+            m_keyCombo->setCompleter(cpl);
+            // Block Enter/Return on the key line edit so it doesn't close the dialog
+            if (auto* le = m_keyCombo->lineEdit())
+            {
+                le->installEventFilter(this);
+            }
+            vl->addWidget(m_keyCombo);
+
+            // Value — multi-line editable; fixed at 4 lines, grows with content up to 4 (no label)
+            m_valueEdit = new QTextEdit(this);
+            m_valueEdit->setAcceptRichText(false);
+            m_valueEdit->setPlaceholderText("Localised text\xe2\x80\xa6");
+            m_valueEdit->setPlainText(m_originalValue);
+            m_valueEdit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+            vl->addWidget(m_valueEdit);
+
+            // Dynamic button row
+            auto* btnRow = new QHBoxLayout();
+            btnRow->addStretch();
+            m_closeBtn  = new QPushButton("Close",  this);
+            m_assignBtn = new QPushButton("Assign", this);
+            m_createBtn = new QPushButton("Create", this);
+            m_updateBtn = new QPushButton("Update", this);
+            m_cancelBtn = new QPushButton("Cancel", this);
+            for (auto* b : {m_closeBtn, m_assignBtn, m_createBtn, m_updateBtn, m_cancelBtn})
+            {
+                b->setAutoDefault(false);
+                b->setDefault(false);
+                btnRow->addWidget(b);
+            }
+            vl->addLayout(btnRow);
+
+            // Only update value when user selects from dropdown or confirms with Enter on known key
+            connect(m_keyCombo, QOverload<int>::of(&QComboBox::activated),
+                    this, &LexiconFieldModal::onKeyActivated);
+            connect(m_keyCombo->lineEdit(), &QLineEdit::editingFinished,
+                    this, &LexiconFieldModal::onKeyEditingFinished);
+            connect(m_valueEdit->document(), &QTextDocument::contentsChanged,
+                    this, &LexiconFieldModal::onValueChanged);
+
+            connect(m_closeBtn,  &QPushButton::clicked, this, [this]
+            { m_result = {Action::None, {}, {}}; accept(); });
+            connect(m_assignBtn, &QPushButton::clicked, this, [this]
+            { m_result = {Action::Assign, m_keyCombo->currentText().trimmed(), m_valueEdit->toPlainText()}; accept(); });
+            connect(m_createBtn, &QPushButton::clicked, this, [this]
+            { m_result = {Action::Create, m_keyCombo->currentText().trimmed(), m_valueEdit->toPlainText()}; accept(); });
+            connect(m_updateBtn, &QPushButton::clicked, this, [this]
+            { m_result = {Action::Update, m_keyCombo->currentText().trimmed(), m_valueEdit->toPlainText()}; accept(); });
+            connect(m_cancelBtn, &QPushButton::clicked, this, &QDialog::reject);
+
+            // Size the value edit to 4 lines on first show
+            QTimer::singleShot(0, this, [this]{ setValueHeight(); });
+            updateButtons();
+        }
+
+        Result result() const { return m_result; }
+
+    protected:
+        bool eventFilter(QObject* obj, QEvent* ev) override
+        {
+            if (obj == m_keyCombo->lineEdit() && ev->type() == QEvent::KeyPress)
+            {
+                const auto* ke = static_cast<QKeyEvent*>(ev);
+                if (ke->key() == Qt::Key_Return || ke->key() == Qt::Key_Enter)
+                {
+                    onKeyEditingFinished();
+                    return true; // consume — don't let it close the dialog
+                }
+            }
+            return QDialog::eventFilter(obj, ev);
+        }
+
+    private:
+        void setValueHeight()
+        {
+            const int lh      = m_valueEdit->fontMetrics().lineSpacing();
+            const int fw      = m_valueEdit->frameWidth();
+            const int overhead = fw * 2 + 8;
+            const int paragraphs = qMax(1, m_valueEdit->toPlainText().count('\n') + 1);
+            const int target   = lh * qBound(1, paragraphs, 4) + overhead;
+            // Enforce at least 4-line height as the initial size
+            const int initial  = lh * 4 + overhead;
+            m_valueEdit->setFixedHeight(qMax(target, initial));
+            adjustSize();
+        }
+
+        void onKeyActivated(int /*index*/)
+        {
+            const QString val = m_fetchValue(m_keyCombo->currentText().trimmed());
+            m_suppressValueSignal = true;
+            m_valueEdit->setPlainText(val);
+            m_suppressValueSignal = false;
+            setValueHeight();
+            updateButtons();
+        }
+
+        void onKeyEditingFinished()
+        {
+            const QString key = m_keyCombo->currentText().trimmed();
+            const QString val = m_fetchValue(key);
+            if (!val.isEmpty())
+            {
+                m_suppressValueSignal = true;
+                m_valueEdit->setPlainText(val);
+                m_suppressValueSignal = false;
+                setValueHeight();
+            }
+            updateButtons();
+        }
+
+        void onValueChanged()
+        {
+            if (m_suppressValueSignal) return;
+            setValueHeight();
+            updateButtons();
+        }
+
+        void updateButtons()
+        {
+            const QString curKey = m_keyCombo->currentText().trimmed();
+            const QString curVal = m_valueEdit->toPlainText();
+            const bool keyChanged   = (curKey != m_originalKey);
+            const bool valueChanged = (!keyChanged && curVal != m_originalValue);
+            const bool keyInLexicon = (!curKey.isEmpty() && !m_fetchValue(curKey).isEmpty());
+
+            const bool showClose  = !keyChanged && !valueChanged;
+            const bool showAssign = keyChanged  && keyInLexicon;
+            const bool showCreate = keyChanged  && !keyInLexicon;
+            const bool showUpdate = valueChanged;
+
+            m_closeBtn ->setVisible(showClose);
+            m_assignBtn->setVisible(showAssign);
+            m_createBtn->setVisible(showCreate);
+            m_updateBtn->setVisible(showUpdate);
+            m_cancelBtn->setVisible(!showClose);
+        }
+
+        QString   m_originalKey;
+        QString   m_originalValue;
+        bool      m_suppressValueSignal = false;
+        Result    m_result;
+        std::function<QString(const QString&)> m_fetchValue;
+
+        QComboBox*   m_keyCombo  = nullptr;
+        QTextEdit*   m_valueEdit = nullptr;
+        QPushButton* m_closeBtn  = nullptr;
+        QPushButton* m_assignBtn = nullptr;
+        QPushButton* m_createBtn = nullptr;
+        QPushButton* m_updateBtn = nullptr;
+        QPushButton* m_cancelBtn = nullptr;
+    };
+
+    // =========================================================================
+    // OperationEditorModal — edit one OghamOperation
+    // =========================================================================
+
+    class OperationEditorModal : public QDialog
+    {
+        using AddTagFn = std::function<void(const QString&, QToolButton*)>;
+    public:
+        OperationEditorModal(const OghamOperation& op,
+                             const QStringList&    knownTags,
+                             AddTagFn              addTagFn,
+                             QWidget*              parent = nullptr)
+            : QDialog(parent, Qt::Dialog | Qt::FramelessWindowHint)
+            , m_op(op)
+            , m_knownTags(knownTags)
+            , m_addTagFn(std::move(addTagFn))
+        {
+            setWindowTitle("Edit Operation");
+            setMinimumWidth(460);
+            auto* vl = new QVBoxLayout(this);
+            vl->setSpacing(8);
+
+            // ── Top form: tag + arithmetic + value ────────────────────────
+            auto* topRow = new QWidget(this);
+            auto* hl     = new QHBoxLayout(topRow);
+            hl->setContentsMargins(0,0,0,0);
+            hl->setSpacing(4);
+
+            m_tagStatus = new QToolButton(topRow);
+            m_tagStatus->setFixedWidth(26);
+            m_tagStatus->setAutoRaise(true);
+
+            m_tagCombo = new QComboBox(topRow);
+            m_tagCombo->setEditable(true);
+            m_tagCombo->setInsertPolicy(QComboBox::NoInsert);
+            m_tagCombo->addItems(knownTags);
+            m_tagCombo->setCurrentText(op.tag);
+            m_tagCombo->setPlaceholderText("tag");
+            auto* cpl = new QCompleter(knownTags, m_tagCombo);
+            cpl->setCaseSensitivity(Qt::CaseInsensitive);
+            cpl->setFilterMode(Qt::MatchContains);
+            m_tagCombo->setCompleter(cpl);
+            ApplyTagStatus(m_tagStatus, op.tag, knownTags);
+            refreshTagStatusConn();
+
+            m_arithCombo = new QComboBox(topRow);
+            m_arithCombo->addItems(kModalArithmetics);
+            m_arithCombo->setCurrentText(op.arithmetic);
+
+            m_valueBox = new QSpinBox(topRow);
+            m_valueBox->setRange(-99999, 99999);
+            m_valueBox->setValue(op.value);
+
+            hl->addWidget(m_tagStatus);
+            hl->addWidget(m_tagCombo, 3);
+            hl->addWidget(m_arithCombo, 2);
+            hl->addWidget(m_valueBox, 1);
+            vl->addWidget(topRow);
+
+            connect(m_tagCombo, &QComboBox::editTextChanged, this,
+                [this](const QString& v)
+                {
+                    m_op.tag = v.trimmed();
+                    ApplyTagStatus(m_tagStatus, v.trimmed(), m_knownTags);
+                    refreshTagStatusConn();
+                });
+            connect(m_arithCombo, &QComboBox::currentTextChanged, this,
+                [this](const QString& v){ m_op.arithmetic = v; });
+            connect(m_valueBox, QOverload<int>::of(&QSpinBox::valueChanged), this,
+                [this](int v){ m_op.value = v; });
+
+            // ── Conditions ────────────────────────────────────────────────
+            auto* condHdr = new QHBoxLayout();
+            condHdr->addWidget(new QLabel("<b>Conditions</b>", this));
+            condHdr->addStretch();
+            auto* addCondBtn = makeAddBtn(this);
+            condHdr->addWidget(addCondBtn);
+            vl->addLayout(condHdr);
+
+            auto* condScroll = new QScrollArea(this);
+            condScroll->setWidgetResizable(true);
+            condScroll->setMaximumHeight(180);
+            m_condArea   = new QWidget(this);
+            m_condLayout = new QVBoxLayout(m_condArea);
+            m_condLayout->setContentsMargins(0,0,0,0);
+            m_condLayout->setSpacing(2);
+            condScroll->setWidget(m_condArea);
+            vl->addWidget(condScroll);
+
+            connect(addCondBtn, &QPushButton::clicked, this, [this]
+            {
+                m_op.conditions.append(OghamCondition{});
+                rebuildConditions();
+            });
+            rebuildConditions();
+
+            auto* btns = new QDialogButtonBox(
+                QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+            if (auto* ok = btns->button(QDialogButtonBox::Ok))
+                { ok->setAutoDefault(false); ok->setDefault(false); }
+            vl->addWidget(btns);
+            connect(btns, &QDialogButtonBox::accepted, this, &QDialog::accept);
+            connect(btns, &QDialogButtonBox::rejected, this, &QDialog::reject);
+        }
+
+        OghamOperation result() const { return m_op; }
+
+    private:
+        void refreshTagStatusConn()
+        {
+            m_tagStatus->disconnect();
+            if (m_tagStatus->isEnabled())
+                connect(m_tagStatus, &QToolButton::clicked, this,
+                    [this]{ m_addTagFn(m_op.tag, m_tagStatus); });
+        }
+
+        void rebuildConditions()
+        {
+            while (QLayoutItem* it = m_condLayout->takeAt(0))
+            { if (QWidget* w = it->widget()) w->deleteLater(); delete it; }
+
+            const int total = m_op.conditions.size();
+            for (int ci = 0; ci < total; ++ci)
+            {
+                const OghamCondition& cond = m_op.conditions[ci];
+                auto* row  = new QWidget(m_condArea);
+                auto* hl   = new QHBoxLayout(row);
+                hl->setContentsMargins(0,0,0,0);
+                hl->setSpacing(3);
+
+                // Tag status icon
+                auto* st = new QToolButton(row);
+                st->setFixedWidth(24);
+                st->setAutoRaise(true);
+                ApplyTagStatus(st, cond.tag, m_knownTags);
+                if (st->isEnabled())
+                    connect(st, &QToolButton::clicked, this,
+                        [this, ci]{ m_addTagFn(ci < m_op.conditions.size() ? m_op.conditions[ci].tag : QString{}, nullptr); });
+
+                // Tag combo
+                auto* tagCb = new QComboBox(row);
+                tagCb->setEditable(true);
+                tagCb->setInsertPolicy(QComboBox::NoInsert);
+                tagCb->addItems(m_knownTags);
+                tagCb->setCurrentText(cond.tag);
+                tagCb->setPlaceholderText("tag");
+                auto* cp = new QCompleter(m_knownTags, tagCb);
+                cp->setCaseSensitivity(Qt::CaseInsensitive);
+                cp->setFilterMode(Qt::MatchContains);
+                tagCb->setCompleter(cp);
+                connect(tagCb, &QComboBox::editTextChanged, this,
+                    [this, ci, st](const QString& t)
+                    {
+                        if (ci < m_op.conditions.size()) m_op.conditions[ci].tag = t.trimmed();
+                        ApplyTagStatus(st, t.trimmed(), m_knownTags);
+                        st->disconnect();
+                        if (st->isEnabled())
+                            connect(st, &QToolButton::clicked, this,
+                                [this, t]{ m_addTagFn(t.trimmed(), nullptr); });
+                    });
+
+                // Comparison combo
+                auto* cmpCb = new QComboBox(row);
+                cmpCb->addItems(kModalComparisons);
+                cmpCb->setCurrentText(cond.comparison);
+
+                // Value spin (hidden for Exists/NotExists)
+                auto* valSp = new QSpinBox(row);
+                valSp->setRange(-99999, 99999);
+                valSp->setValue(cond.value);
+                valSp->setVisible(kModalIsNumeric(cond.comparison));
+
+                connect(cmpCb, &QComboBox::currentTextChanged, this,
+                    [this, ci, valSp](const QString& t)
+                    {
+                        if (ci < m_op.conditions.size()) m_op.conditions[ci].comparison = t;
+                        valSp->setVisible(kModalIsNumeric(t));
+                    });
+                connect(valSp, QOverload<int>::of(&QSpinBox::valueChanged), this,
+                    [this, ci](int v)
+                    { if (ci < m_op.conditions.size()) m_op.conditions[ci].value = v; });
+
+                // Logic-op combo (hidden on last row)
+                auto* logCb = new QComboBox(row);
+                logCb->addItems(kModalLogicOps);
+                if (!cond.logicOp.isEmpty()) logCb->setCurrentText(cond.logicOp);
+                logCb->setVisible(ci < total - 1);
+                connect(logCb, &QComboBox::currentTextChanged, this,
+                    [this, ci](const QString& t)
+                    { if (ci < m_op.conditions.size()) m_op.conditions[ci].logicOp = t; });
+
+                // Remove button
+                auto* remBtn = makeRemoveBtn(row);
+                connect(remBtn, &QPushButton::clicked, this, [this, ci]
+                {
+                    if (ci < m_op.conditions.size()) m_op.conditions.removeAt(ci);
+                    rebuildConditions();
+                });
+
+                hl->addWidget(st);
+                hl->addWidget(tagCb, 3);
+                hl->addWidget(cmpCb, 2);
+                hl->addWidget(valSp, 1);
+                hl->addWidget(logCb, 1);
+                hl->addWidget(remBtn);
+                m_condLayout->addWidget(row);
+            }
+            if (total == 0)
+                m_condLayout->addWidget(new QLabel("(none)", m_condArea));
+            m_condLayout->addStretch();
+        }
+
+        OghamOperation m_op;
+        QStringList    m_knownTags;
+        AddTagFn       m_addTagFn;
+        QToolButton*   m_tagStatus  = nullptr;
+        QComboBox*     m_tagCombo   = nullptr;
+        QComboBox*     m_arithCombo = nullptr;
+        QSpinBox*      m_valueBox   = nullptr;
+        QWidget*       m_condArea   = nullptr;
+        QVBoxLayout*   m_condLayout = nullptr;
+    };
+
+    // =========================================================================
+    // OptionEditorModal — edit one OghamSourceOption (Choice ID / Localise ID / Conditions / Operations)
+    // =========================================================================
+
+    class OptionEditorModal : public QDialog
+    {
+        using AddTagFn = std::function<void(const QString&, QToolButton*)>;
+        using FetchValFn = std::function<QString(const QString&)>;
+    public:
+        OptionEditorModal(const OghamSourceOption& opt,
+                          const QStringList&       lexiconKeys,
+                          const QStringList&       oghamTags,
+                          AddTagFn                 addTagFn,
+                          FetchValFn               fetchLexVal,
+                          QWidget*                 parent = nullptr)
+            : QDialog(parent, Qt::Dialog | Qt::FramelessWindowHint)
+            , m_opt(opt)
+            , m_oghamTags(oghamTags)
+            , m_lexiconKeys(lexiconKeys)
+            , m_addTagFn(std::move(addTagFn))
+            , m_fetchLexVal(std::move(fetchLexVal))
+        {
+            setMinimumWidth(520);
+            auto* vl = new QVBoxLayout(this);
+            vl->setSpacing(6);
+            vl->setContentsMargins(12, 12, 12, 12);
+
+            auto* form = new QFormLayout();
+            form->setSpacing(6);
+
+            // ── Choice ID (tag) ───────────────────────────────────────────
+            auto* tagRow = new QWidget(this);
+            auto* tagHL  = new QHBoxLayout(tagRow);
+            tagHL->setContentsMargins(0,0,0,0);
+            tagHL->setSpacing(4);
+
+            m_tagStatus = new QToolButton(tagRow);
+            m_tagStatus->setFixedWidth(26);
+            m_tagStatus->setAutoRaise(true);
+
+            m_tagCombo = new QComboBox(tagRow);
+            m_tagCombo->setEditable(true);
+            m_tagCombo->setInsertPolicy(QComboBox::NoInsert);
+            m_tagCombo->addItems(oghamTags);
+            m_tagCombo->setCurrentText(opt.tag);
+            m_tagCombo->setPlaceholderText("choice tag\xe2\x80\xa6");
+            auto* tagCpl = new QCompleter(oghamTags, m_tagCombo);
+            tagCpl->setCaseSensitivity(Qt::CaseInsensitive);
+            tagCpl->setFilterMode(Qt::MatchContains);
+            m_tagCombo->setCompleter(tagCpl);
+            ApplyTagStatus(m_tagStatus, opt.tag, oghamTags);
+            refreshTagStatusConn();
+            tagHL->addWidget(m_tagStatus);
+            tagHL->addWidget(m_tagCombo);
+            form->addRow("Choice ID:", tagRow);
+            connect(m_tagCombo, &QComboBox::editTextChanged, this,
+                [this](const QString& v)
+                {
+                    m_opt.tag = v.trimmed();
+                    ApplyTagStatus(m_tagStatus, v.trimmed(), m_oghamTags);
+                    refreshTagStatusConn();
+                });
+
+            // ── Localise ID (textKey) ─────────────────────────────────────
+            m_keyCombo = new QComboBox(this);
+            m_keyCombo->setEditable(true);
+            m_keyCombo->setInsertPolicy(QComboBox::NoInsert);
+            m_keyCombo->addItems(lexiconKeys);
+            m_keyCombo->setCurrentText(opt.textKey);
+            m_keyCombo->setPlaceholderText("localisation key\xe2\x80\xa6");
+            auto* keyCpl = new QCompleter(lexiconKeys, m_keyCombo);
+            keyCpl->setCaseSensitivity(Qt::CaseInsensitive);
+            keyCpl->setFilterMode(Qt::MatchContains);
+            m_keyCombo->setCompleter(keyCpl);
+            form->addRow("Localise ID:", m_keyCombo);
+
+            // ── Localised Value (read-only preview) ───────────────────────
+            m_valueEdit = new QLineEdit(m_fetchLexVal(opt.textKey), this);
+            m_valueEdit->setPlaceholderText("localised text\xe2\x80\xa6");
+            m_valueEdit->setReadOnly(true);
+            form->addRow("Localised Value:", m_valueEdit);
+            connect(m_keyCombo, &QComboBox::editTextChanged, this,
+                [this](const QString& v)
+                {
+                    m_opt.textKey = v.trimmed();
+                    m_valueEdit->setText(m_fetchLexVal(v.trimmed()));
+                });
+
+            vl->addLayout(form);
+
+            // ── Collapsible Conditions ────────────────────────────────────
+            {
+                auto* hdr = new QHBoxLayout();
+                m_condToggle = new QToolButton(this);
+                m_condToggle->setText("\xe2\x96\xb6"); // ▶
+                m_condToggle->setCheckable(true);
+                m_condToggle->setAutoRaise(true);
+                m_condToggle->setChecked(!opt.conditions.isEmpty());
+                hdr->addWidget(m_condToggle);
+                hdr->addWidget(new QLabel("<b>Conditions</b>", this));
+                hdr->addStretch();
+                auto* addCondBtn = makeAddBtn(this);
+                hdr->addWidget(addCondBtn);
+                vl->addLayout(hdr);
+
+                m_condScroll = new QScrollArea(this);
+                m_condScroll->setWidgetResizable(true);
+                m_condScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+                m_condArea   = new QWidget(this);
+                m_condLayout = new QVBoxLayout(m_condArea);
+                m_condLayout->setContentsMargins(0,0,0,0);
+                m_condLayout->setSpacing(2);
+                m_condScroll->setWidget(m_condArea);
+                vl->addWidget(m_condScroll);
+
+                connect(m_condToggle, &QToolButton::toggled, this, [this](bool on)
+                {
+                    m_condToggle->setText(on ? "\xe2\x96\xbc" : "\xe2\x96\xb6");
+                    m_condScroll->setVisible(on);
+                    if (on) updateCondScrollHeight(); else adjustSize();
+                });
+                connect(addCondBtn, &QPushButton::clicked, this, [this]
+                {
+                    m_opt.conditions.append(OghamCondition{});
+                    if (!m_condToggle->isChecked()) m_condToggle->setChecked(true);
+                    rebuildConditions();
+                    updateCondScrollHeight();
+                });
+                rebuildConditions();
+                m_condScroll->setVisible(!opt.conditions.isEmpty());
+            }
+
+            // ── Collapsible Operations ────────────────────────────────────
+            {
+                auto* hdr = new QHBoxLayout();
+                m_opsToggle = new QToolButton(this);
+                m_opsToggle->setText("\xe2\x96\xb6"); // ▶
+                m_opsToggle->setCheckable(true);
+                m_opsToggle->setAutoRaise(true);
+                m_opsToggle->setChecked(!opt.operations.isEmpty());
+                hdr->addWidget(m_opsToggle);
+                hdr->addWidget(new QLabel("<b>Operations</b>", this));
+                hdr->addStretch();
+                auto* addOpBtn = makeAddBtn(this);
+                hdr->addWidget(addOpBtn);
+                vl->addLayout(hdr);
+
+                m_opsScroll = new QScrollArea(this);
+                m_opsScroll->setWidgetResizable(true);
+                m_opsScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+                m_opsScroll->setMinimumHeight(80);
+                m_opsArea   = new QWidget(this);
+                m_opsLayout = new QVBoxLayout(m_opsArea);
+                m_opsLayout->setContentsMargins(0,0,0,0);
+                m_opsLayout->setSpacing(4);
+                m_opsScroll->setWidget(m_opsArea);
+                vl->addWidget(m_opsScroll);
+
+                connect(m_opsToggle, &QToolButton::toggled, this, [this](bool on)
+                {
+                    m_opsToggle->setText(on ? "\xe2\x96\xbc" : "\xe2\x96\xb6");
+                    m_opsScroll->setVisible(on);
+                    adjustSize();
+                });
+                connect(addOpBtn, &QPushButton::clicked, this, [this]
+                {
+                    m_opt.operations.append(OghamOperation{});
+                    if (!m_opsToggle->isChecked()) m_opsToggle->setChecked(true);
+                    rebuildOperations();
+                });
+                rebuildOperations();
+                m_opsScroll->setVisible(!opt.operations.isEmpty());
+            }
+
+            // Mutual exclusion: expanding one section collapses the other
+            connect(m_condToggle, &QToolButton::toggled, this, [this](bool on){ if (on) m_opsToggle->setChecked(false); });
+            connect(m_opsToggle,  &QToolButton::toggled, this, [this](bool on){ if (on) m_condToggle->setChecked(false); });
+
+            auto* btns = new QDialogButtonBox(
+                QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+            if (auto* ok = btns->button(QDialogButtonBox::Ok))
+                { ok->setAutoDefault(false); ok->setDefault(false); }
+            vl->addWidget(btns);
+            connect(btns, &QDialogButtonBox::accepted, this, &QDialog::accept);
+            connect(btns, &QDialogButtonBox::rejected, this, &QDialog::reject);
+
+            // Update conditions scroll area max height after layout is built
+            QTimer::singleShot(0, this, [this]{ updateCondScrollHeight(); });
+        }
+
+        OghamSourceOption result() const { return m_opt; }
+
+    private:
+        void refreshTagStatusConn()
+        {
+            m_tagStatus->disconnect();
+            if (m_tagStatus->isEnabled())
+                connect(m_tagStatus, &QToolButton::clicked, this,
+                    [this]{ m_addTagFn(m_opt.tag, m_tagStatus); });
+        }
+
+        // Build one condition row inside a parent widget/layout
+        QWidget* makeCondRow(int ci, QWidget* parent)
+        {
+            const OghamCondition& cond = m_opt.conditions[ci];
+            auto* row = new QWidget(parent);
+            auto* hl  = new QHBoxLayout(row);
+            hl->setContentsMargins(0,0,0,0);
+            hl->setSpacing(3);
+
+            auto* st = new QToolButton(row);
+            st->setFixedWidth(24);
+            st->setAutoRaise(true);
+            ApplyTagStatus(st, cond.tag, m_oghamTags);
+            if (st->isEnabled())
+                connect(st, &QToolButton::clicked, this,
+                    [this, ci]{ m_addTagFn(ci < m_opt.conditions.size() ? m_opt.conditions[ci].tag : QString{}, nullptr); });
+
+            auto* tagCb = new QComboBox(row);
+            tagCb->setEditable(true);
+            tagCb->setInsertPolicy(QComboBox::NoInsert);
+            tagCb->addItems(m_oghamTags);
+            tagCb->setCurrentText(cond.tag);
+            tagCb->setPlaceholderText("tag");
+            auto* cp = new QCompleter(m_oghamTags, tagCb);
+            cp->setCaseSensitivity(Qt::CaseInsensitive);
+            cp->setFilterMode(Qt::MatchContains);
+            tagCb->setCompleter(cp);
+            connect(tagCb, &QComboBox::editTextChanged, this,
+                [this, ci, st](const QString& t)
+                {
+                    if (ci < m_opt.conditions.size()) m_opt.conditions[ci].tag = t.trimmed();
+                    ApplyTagStatus(st, t.trimmed(), m_oghamTags);
+                    st->disconnect();
+                    if (st->isEnabled())
+                        connect(st, &QToolButton::clicked, this,
+                            [this, t]{ m_addTagFn(t.trimmed(), nullptr); });
+                });
+
+            auto* cmpCb = new QComboBox(row);
+            cmpCb->addItems(kModalComparisons);
+            cmpCb->setCurrentText(cond.comparison);
+
+            auto* valSp = new QSpinBox(row);
+            valSp->setRange(-99999, 99999);
+            valSp->setValue(cond.value);
+            valSp->setVisible(kModalIsNumeric(cond.comparison));
+
+            connect(cmpCb, &QComboBox::currentTextChanged, this,
+                [this, ci, valSp](const QString& t)
+                {
+                    if (ci < m_opt.conditions.size()) m_opt.conditions[ci].comparison = t;
+                    valSp->setVisible(kModalIsNumeric(t));
+                });
+            connect(valSp, QOverload<int>::of(&QSpinBox::valueChanged), this,
+                [this, ci](int v)
+                { if (ci < m_opt.conditions.size()) m_opt.conditions[ci].value = v; });
+
+            const int total = m_opt.conditions.size();
+            auto* logCb = new QComboBox(row);
+            logCb->addItems(kModalLogicOps);
+            if (!cond.logicOp.isEmpty()) logCb->setCurrentText(cond.logicOp);
+            logCb->setVisible(ci < total - 1);
+            connect(logCb, &QComboBox::currentTextChanged, this,
+                [this, ci](const QString& t)
+                { if (ci < m_opt.conditions.size()) m_opt.conditions[ci].logicOp = t; });
+
+            auto* remBtn = makeRemoveBtn(row);
+            connect(remBtn, &QPushButton::clicked, this, [this, ci]
+            {
+                if (ci < m_opt.conditions.size()) m_opt.conditions.removeAt(ci);
+                rebuildConditions();
+                updateCondScrollHeight();
+            });
+
+            hl->addWidget(st);
+            hl->addWidget(tagCb, 3);
+            hl->addWidget(cmpCb, 2);
+            hl->addWidget(valSp, 1);
+            hl->addWidget(logCb, 1);
+            hl->addWidget(remBtn);
+            return row;
+        }
+
+        void rebuildConditions()
+        {
+            while (QLayoutItem* it = m_condLayout->takeAt(0))
+            { if (QWidget* w = it->widget()) w->deleteLater(); delete it; }
+            const int total = m_opt.conditions.size();
+            for (int ci = 0; ci < total; ++ci)
+                m_condLayout->addWidget(makeCondRow(ci, m_condArea));
+            if (total == 0)
+                m_condLayout->addWidget(new QLabel("(none)", m_condArea));
+            m_condLayout->addStretch();
+            if (m_condScroll) updateCondScrollHeight();
+        }
+
+        void rebuildOperations()
+        {
+            while (QLayoutItem* it = m_opsLayout->takeAt(0))
+            { if (QWidget* w = it->widget()) w->deleteLater(); delete it; }
+
+            const int total = m_opt.operations.size();
+            for (int oi = 0; oi < total; ++oi)
+            {
+                const OghamOperation& op = m_opt.operations[oi];
+                auto* frame = new QFrame(m_opsArea);
+                frame->setFrameShape(QFrame::StyledPanel);
+                auto* fl = new QVBoxLayout(frame);
+                fl->setContentsMargins(6,4,6,4);
+                fl->setSpacing(4);
+
+                // Top row: status icon + tag combo + arithmetic + value + X
+                auto* topRow = new QWidget(frame);
+                auto* hl     = new QHBoxLayout(topRow);
+                hl->setContentsMargins(0,0,0,0);
+                hl->setSpacing(4);
+
+                auto* st = new QToolButton(topRow);
+                st->setFixedWidth(26);
+                st->setAutoRaise(true);
+                ApplyTagStatus(st, op.tag, m_oghamTags);
+                if (st->isEnabled())
+                    connect(st, &QToolButton::clicked, this,
+                        [this, oi]{ m_addTagFn(oi < m_opt.operations.size() ? m_opt.operations[oi].tag : QString{}, nullptr); });
+
+                auto* tagCb = new QComboBox(topRow);
+                tagCb->setEditable(true);
+                tagCb->setInsertPolicy(QComboBox::NoInsert);
+                tagCb->addItems(m_oghamTags);
+                tagCb->setCurrentText(op.tag);
+                tagCb->setPlaceholderText("tag");
+                auto* cp = new QCompleter(m_oghamTags, tagCb);
+                cp->setCaseSensitivity(Qt::CaseInsensitive);
+                cp->setFilterMode(Qt::MatchContains);
+                tagCb->setCompleter(cp);
+                connect(tagCb, &QComboBox::editTextChanged, this,
+                    [this, oi, st](const QString& v)
+                    {
+                        if (oi < m_opt.operations.size()) m_opt.operations[oi].tag = v.trimmed();
+                        ApplyTagStatus(st, v.trimmed(), m_oghamTags);
+                        st->disconnect();
+                        if (st->isEnabled())
+                            connect(st, &QToolButton::clicked, this,
+                                [this, v]{ m_addTagFn(v.trimmed(), nullptr); });
+                    });
+
+                auto* arithCb = new QComboBox(topRow);
+                arithCb->addItems(kModalArithmetics);
+                arithCb->setCurrentText(op.arithmetic);
+                connect(arithCb, &QComboBox::currentTextChanged, this,
+                    [this, oi](const QString& v)
+                    { if (oi < m_opt.operations.size()) m_opt.operations[oi].arithmetic = v; });
+
+                auto* valSp = new QSpinBox(topRow);
+                valSp->setRange(-99999, 99999);
+                valSp->setValue(op.value);
+                connect(valSp, QOverload<int>::of(&QSpinBox::valueChanged), this,
+                    [this, oi](int v)
+                    { if (oi < m_opt.operations.size()) m_opt.operations[oi].value = v; });
+
+                auto* remBtn = makeRemoveBtn(topRow);
+                connect(remBtn, &QPushButton::clicked, this, [this, oi]
+                { if (oi < m_opt.operations.size()) m_opt.operations.removeAt(oi); rebuildOperations(); });
+
+                hl->addWidget(st);
+                hl->addWidget(tagCb, 3);
+                hl->addWidget(arithCb, 2);
+                hl->addWidget(valSp, 1);
+                hl->addWidget(remBtn);
+                fl->addWidget(topRow);
+
+                // Nested conditions
+                auto* condHdr = new QHBoxLayout();
+                condHdr->addWidget(new QLabel("  Conditions:", frame));
+                condHdr->addStretch();
+                auto* addCondBtn = makeAddBtn(frame);
+                condHdr->addWidget(addCondBtn);
+                fl->addLayout(condHdr);
+
+                auto* condContainer = new QWidget(frame);
+                auto* condVL        = new QVBoxLayout(condContainer);
+                condVL->setContentsMargins(12,0,0,0);
+                condVL->setSpacing(2);
+
+                // Populate op conditions
+                const int nConds = op.conditions.size();
+                for (int k = 0; k < nConds; ++k)
+                {
+                    // Build an inline condition row for op[oi].conditions[k]
+                    const OghamCondition& c = op.conditions[k];
+                    auto* crow = new QWidget(condContainer);
+                    auto* chl  = new QHBoxLayout(crow);
+                    chl->setContentsMargins(0,0,0,0);
+                    chl->setSpacing(3);
+
+                    auto* cst = new QToolButton(crow);
+                    cst->setFixedWidth(24);
+                    cst->setAutoRaise(true);
+                    ApplyTagStatus(cst, c.tag, m_oghamTags);
+
+                    auto* cTagCb = new QComboBox(crow);
+                    cTagCb->setEditable(true);
+                    cTagCb->setInsertPolicy(QComboBox::NoInsert);
+                    cTagCb->addItems(m_oghamTags);
+                    cTagCb->setCurrentText(c.tag);
+                    cTagCb->setPlaceholderText("tag");
+                    auto* ccp = new QCompleter(m_oghamTags, cTagCb);
+                    ccp->setCaseSensitivity(Qt::CaseInsensitive);
+                    ccp->setFilterMode(Qt::MatchContains);
+                    cTagCb->setCompleter(ccp);
+                    connect(cTagCb, &QComboBox::editTextChanged, this,
+                        [this, oi, k, cst](const QString& t)
+                        {
+                            if (oi < m_opt.operations.size() && k < m_opt.operations[oi].conditions.size())
+                                m_opt.operations[oi].conditions[k].tag = t.trimmed();
+                            ApplyTagStatus(cst, t.trimmed(), m_oghamTags);
+                        });
+
+                    auto* cCmpCb = new QComboBox(crow);
+                    cCmpCb->addItems(kModalComparisons);
+                    cCmpCb->setCurrentText(c.comparison);
+
+                    auto* cValSp = new QSpinBox(crow);
+                    cValSp->setRange(-99999, 99999);
+                    cValSp->setValue(c.value);
+                    cValSp->setVisible(kModalIsNumeric(c.comparison));
+
+                    connect(cCmpCb, &QComboBox::currentTextChanged, this,
+                        [this, oi, k, cValSp](const QString& t)
+                        {
+                            if (oi < m_opt.operations.size() && k < m_opt.operations[oi].conditions.size())
+                                m_opt.operations[oi].conditions[k].comparison = t;
+                            cValSp->setVisible(kModalIsNumeric(t));
+                        });
+                    connect(cValSp, QOverload<int>::of(&QSpinBox::valueChanged), this,
+                        [this, oi, k](int v)
+                        {
+                            if (oi < m_opt.operations.size() && k < m_opt.operations[oi].conditions.size())
+                                m_opt.operations[oi].conditions[k].value = v;
+                        });
+
+                    auto* cLogCb = new QComboBox(crow);
+                    cLogCb->addItems(kModalLogicOps);
+                    if (!c.logicOp.isEmpty()) cLogCb->setCurrentText(c.logicOp);
+                    cLogCb->setVisible(k < nConds - 1);
+                    connect(cLogCb, &QComboBox::currentTextChanged, this,
+                        [this, oi, k](const QString& t)
+                        {
+                            if (oi < m_opt.operations.size() && k < m_opt.operations[oi].conditions.size())
+                                m_opt.operations[oi].conditions[k].logicOp = t;
+                        });
+
+                    auto* cRemBtn = makeRemoveBtn(crow);
+                    connect(cRemBtn, &QPushButton::clicked, this, [this, oi, k]
+                    {
+                        if (oi < m_opt.operations.size() && k < m_opt.operations[oi].conditions.size())
+                            m_opt.operations[oi].conditions.removeAt(k);
+                        rebuildOperations();
+                    });
+
+                    chl->addWidget(cst);
+                    chl->addWidget(cTagCb, 3);
+                    chl->addWidget(cCmpCb, 2);
+                    chl->addWidget(cValSp, 1);
+                    chl->addWidget(cLogCb, 1);
+                    chl->addWidget(cRemBtn);
+                    condVL->addWidget(crow);
+                }
+                if (nConds == 0)
+                    condVL->addWidget(new QLabel("(none)", condContainer));
+
+                connect(addCondBtn, &QPushButton::clicked, this, [this, oi]
+                {
+                    if (oi < m_opt.operations.size())
+                        m_opt.operations[oi].conditions.append(OghamCondition{});
+                    rebuildOperations();
+                });
+
+                fl->addWidget(condContainer);
+                m_opsLayout->addWidget(frame);
+            }
+            if (total == 0)
+                m_opsLayout->addWidget(new QLabel("(none)", m_opsArea));
+            m_opsLayout->addStretch();
+        }
+
+        OghamSourceOption m_opt;
+        QStringList       m_oghamTags;
+        QStringList       m_lexiconKeys;
+        AddTagFn          m_addTagFn;
+        FetchValFn        m_fetchLexVal;
+
+        void updateCondScrollHeight()
+        {
+            const int n    = m_opt.conditions.size();
+            const int rowH = 28; // approximate height of one condition row
+            const int maxH = rowH * 4 + 8;
+            // Fit exactly n rows (min 1 for "(none)" label), cap at 4 rows
+            const int h = (n == 0) ? 26 : qMin(n * rowH + 8, maxH);
+            m_condScroll->setMaximumHeight(h);
+            adjustSize();
+        }
+
+        QToolButton*  m_tagStatus   = nullptr;
+        QComboBox*    m_tagCombo    = nullptr;
+        QComboBox*    m_keyCombo    = nullptr;
+        QLineEdit*    m_valueEdit   = nullptr;
+        QWidget*      m_condArea    = nullptr;
+        QVBoxLayout*  m_condLayout  = nullptr;
+        QWidget*      m_opsArea     = nullptr;
+        QVBoxLayout*  m_opsLayout   = nullptr;
+        QToolButton*  m_condToggle  = nullptr;
+        QToolButton*  m_opsToggle   = nullptr;
+        QScrollArea*  m_condScroll  = nullptr;
+        QScrollArea*  m_opsScroll   = nullptr;
+    };
+
+    // =========================================================================
     // Tag validation helpers (free functions)
     // =========================================================================
 
@@ -203,7 +1182,7 @@ namespace FoundationOgham
     /// allowEmpty: if true, an empty tag is neutral (⚫ disabled) rather than invalid.
     static void ApplyTagStatus(QToolButton* btn, const QString& tag,
                                 const QStringList& knownTags,
-                                bool allowEmpty = false)
+                                bool allowEmpty)
     {
         if (tag.isEmpty())
         {
@@ -268,6 +1247,43 @@ namespace FoundationOgham
         m_layoutBtn->setToolTip("Auto-arrange all visible nodes (BFS tree layout)");
         tbLayout->addWidget(m_layoutBtn);
 
+        tbLayout->addSpacing(8);
+
+        m_snapBtn = new QPushButton("\xe2\x8a\x9e Snap", toolbar);
+        m_snapBtn->setCheckable(true);
+        m_snapBtn->setChecked(false);
+        m_snapBtn->setToolTip("Snap node positions to 20px grid");
+        tbLayout->addWidget(m_snapBtn);
+
+        tbLayout->addSpacing(8);
+
+        m_playFromNodeBtn = new QPushButton("\xe2\x96\xb6 Play from Node", toolbar);
+        m_playFromNodeBtn->setEnabled(false);
+        m_playFromNodeBtn->setStyleSheet(
+            "QPushButton { background-color: #2a5c2a; color: white; "
+            "font-weight: bold; padding: 5px; border-radius: 3px; }"
+            "QPushButton:hover { background-color: #3a7c3a; }"
+            "QPushButton:disabled { background-color: #333333; color: #666666; }");
+        tbLayout->addWidget(m_playFromNodeBtn);
+
+        {
+            auto* alignBtn  = new QPushButton("Align \xe2\x96\xbe", toolbar);
+            auto* alignMenu = new QMenu(toolbar);
+            alignMenu->addAction("Align Left",   [this]{ AlignSelected(0); });
+            alignMenu->addAction("Align Right",  [this]{ AlignSelected(1); });
+            alignMenu->addAction("Center H",     [this]{ AlignSelected(2); });
+            alignMenu->addSeparator();
+            alignMenu->addAction("Align Top",    [this]{ AlignSelected(3); });
+            alignMenu->addAction("Align Bottom", [this]{ AlignSelected(4); });
+            alignMenu->addAction("Center V",     [this]{ AlignSelected(5); });
+            alignMenu->addSeparator();
+            alignMenu->addAction("Distribute H", [this]{ AlignSelected(6); });
+            alignMenu->addAction("Distribute V", [this]{ AlignSelected(7); });
+            alignBtn->setMenu(alignMenu);
+            alignBtn->setToolTip("Align or distribute selected nodes");
+            tbLayout->addWidget(alignBtn);
+        }
+
         tbLayout->addStretch();
 
         // ── Left: 2-column entry tree ────────────────────────────────────────
@@ -280,153 +1296,29 @@ namespace FoundationOgham
         m_tree->setMinimumWidth(150);
         m_tree->setContextMenuPolicy(Qt::CustomContextMenu);
 
-        // ── Right: stacked panel ─────────────────────────────────────────────
-        auto* noSelLabel = new QLabel("Select an entry from the tree to edit.", this);
-        noSelLabel->setAlignment(Qt::AlignCenter);
-
-        auto* formContent = new QWidget(this);
-        auto* formLayout  = new QVBoxLayout(formContent);
-        formLayout->setContentsMargins(8, 8, 8, 8);
-        formLayout->setSpacing(6);
-
-        {
-            m_playFromNodeBtn = new QPushButton(
-                "\xe2\x96\xb6 Play from Node", formContent);
-            m_playFromNodeBtn->setEnabled(false);
-            m_playFromNodeBtn->setStyleSheet(
-                "QPushButton { background-color: #2a5c2a; color: white; "
-                "font-weight: bold; padding: 5px; border-radius: 3px; }"
-                "QPushButton:hover { background-color: #3a7c3a; }"
-                "QPushButton:disabled { background-color: #333333; color: #666666; }");
-            formLayout->addWidget(m_playFromNodeBtn);
-        }
-        {
-            auto* row = new QHBoxLayout();
-            row->addWidget(new QLabel("Tag:", formContent));
-
-            m_tagStatus = new QToolButton(formContent);
-            m_tagStatus->setFixedWidth(26);
-            m_tagStatus->setAutoRaise(true);
-            m_tagStatus->setText("\xe2\x97\x8f");   // ⚫ default until an entry is selected
-            m_tagStatus->setStyleSheet("color: #555555;");
-            m_tagStatus->setEnabled(false);
-            row->addWidget(m_tagStatus);
-
-            m_tagCombo = new QComboBox(formContent);
-            m_tagCombo->setEditable(true);
-            m_tagCombo->setInsertPolicy(QComboBox::NoInsert);
-            m_tagCombo->setPlaceholderText("e.g. Act1.Scene1.Line1");
-            auto* tagCpl = new QCompleter(m_tagCombo);
-            tagCpl->setCaseSensitivity(Qt::CaseInsensitive);
-            tagCpl->setFilterMode(Qt::MatchContains);
-            m_tagCombo->setCompleter(tagCpl);
-            row->addWidget(m_tagCombo, 1);
-            formLayout->addLayout(row);
-        }
-        {
-            auto* row = new QHBoxLayout();
-            row->addWidget(new QLabel("Localisation Keys:", formContent));
-            row->addStretch();
-            auto* addKeyBtn = new QPushButton("+", formContent);
-            addKeyBtn->setFixedSize(22, 22);
-            addKeyBtn->setToolTip("Add localisation key");
-            row->addWidget(addKeyBtn);
-            formLayout->addLayout(row);
-            connect(addKeyBtn, &QPushButton::clicked, this, &OghamStoryteller::OnAddTextKey);
-        }
-
-        m_keysWidget = new QWidget(formContent);
-        m_keysLayout = new QVBoxLayout(m_keysWidget);
-        m_keysLayout->setContentsMargins(0, 0, 0, 0);
-        m_keysLayout->setSpacing(2);
-        formLayout->addWidget(m_keysWidget);
-
-        {
-            static const char* kEntryOpsTooltip =
-                "A collection of Gameplay Tag operations executed when this Dialogue Entry "
-                "is entered. Each operation can optionally have conditions that must be true "
-                "for it to be applied, such as only setting a tag if another already exists.";
-            auto* row = new QHBoxLayout();
-            auto* opsLabel = new QLabel("Operations:", formContent);
-            opsLabel->setToolTip(kEntryOpsTooltip);
-            row->addWidget(opsLabel);
-            row->addStretch();
-            auto* addOpBtn = new QPushButton("+", formContent);
-            addOpBtn->setFixedSize(22, 22);
-            addOpBtn->setToolTip(kEntryOpsTooltip);
-            row->addWidget(addOpBtn);
-            formLayout->addLayout(row);
-            connect(addOpBtn, &QPushButton::clicked,
-                [this]()
-                {
-                    if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-                    auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                    e.entryOperations.append(OghamOperation{});
-                    SetFileDirty(m_selectedFileIdx, true);
-                    RebuildEntryOpsArea();
-                });
-        }
-
-        m_entOpsWidget = new QWidget(formContent);
-        m_entOpsLayout = new QVBoxLayout(m_entOpsWidget);
-        m_entOpsLayout->setContentsMargins(0, 0, 0, 0);
-        m_entOpsLayout->setSpacing(2);
-        formLayout->addWidget(m_entOpsWidget);
-        {
-            static const char* kOptionsTooltip =
-                "A collection of dialogue options associated with this entry. Options are "
-                "typically displayed as choices the player can interact with — buttons, "
-                "keywords, or actions that send signals over the Ogham Dialogue system "
-                "to trigger specific responses in other systems.";
-            auto* row = new QHBoxLayout();
-            auto* optsLabel = new QLabel("Options:", formContent);
-            optsLabel->setToolTip(kOptionsTooltip);
-            row->addWidget(optsLabel);
-            row->addStretch();
-            auto* addOptBtn = new QPushButton("+", formContent);
-            addOptBtn->setFixedSize(22, 22);
-            addOptBtn->setToolTip(kOptionsTooltip);
-            row->addWidget(addOptBtn);
-            formLayout->addLayout(row);
-            connect(addOptBtn, &QPushButton::clicked, this, &OghamStoryteller::OnAddOption);
-        }
-
-        m_optsWidget = new QWidget(formContent);
-        m_optsLayout = new QVBoxLayout(m_optsWidget);
-        m_optsLayout->setContentsMargins(0, 0, 0, 0);
-        m_optsLayout->setSpacing(4);
-        formLayout->addWidget(m_optsWidget);
-
-        formLayout->addStretch();
-
-        auto* formScroll = new QScrollArea(this);
-        formScroll->setWidget(formContent);
-        formScroll->setWidgetResizable(true);
-        formScroll->setMinimumWidth(150);
-
-        m_formStack = new QStackedWidget(this);
-        m_formStack->addWidget(noSelLabel);
-        m_formStack->addWidget(formScroll);
-        m_formStack->setCurrentIndex(0);
-
         // ── Graph viewport ────────────────────────────────────────────────────
         m_graphView = new OghamGraphView(this);
 
-        // ── Inner splitter: graph | form ──────────────────────────────────────
-        m_innerSplitter = new QSplitter(Qt::Horizontal, this);
-        m_innerSplitter->addWidget(m_graphView);
-        m_innerSplitter->addWidget(m_formStack);
-        m_innerSplitter->setStretchFactor(0, 6);
-        m_innerSplitter->setStretchFactor(1, 3);
-        m_formStack->setMinimumWidth(150);
+        // ── Outer splitter: [search+tree panel] | graph ───────────────────────
+        {
+            auto* treePanel  = new QWidget(this);
+            auto* treePanelL = new QVBoxLayout(treePanel);
+            treePanelL->setContentsMargins(0, 0, 0, 0);
+            treePanelL->setSpacing(2);
 
-        // ── Outer splitter: tree | inner ──────────────────────────────────────
-        m_splitter = new QSplitter(Qt::Horizontal, this);
-        m_splitter->addWidget(m_tree);
-        m_splitter->addWidget(m_innerSplitter);
-        m_splitter->setStretchFactor(0, 2);
-        m_splitter->setStretchFactor(1, 8);
-        m_tree->setMinimumWidth(150);
+            m_treeSearch = new QLineEdit(treePanel);
+            m_treeSearch->setPlaceholderText("Filter entries\xe2\x80\xa6");
+            m_treeSearch->setClearButtonEnabled(true);
+            treePanelL->addWidget(m_treeSearch);
+            treePanelL->addWidget(m_tree);
+
+            m_splitter = new QSplitter(Qt::Horizontal, this);
+            m_splitter->addWidget(treePanel);
+            m_splitter->addWidget(m_graphView);
+            m_splitter->setStretchFactor(0, 2);
+            m_splitter->setStretchFactor(1, 8);
+            treePanel->setMinimumWidth(150);
+        }
 
         // ── Status bar ───────────────────────────────────────────────────────
         m_statusLabel = new QLabel("No files loaded.", this);
@@ -447,65 +1339,9 @@ namespace FoundationOgham
         connect(m_saveAllBtn,  &QPushButton::clicked, this, &OghamStoryteller::OnSaveAll);
         connect(m_openSrcBtn,  &QPushButton::clicked, this, &OghamStoryteller::OnOpenSource);
         connect(m_layoutBtn,   &QPushButton::clicked, this, &OghamStoryteller::OnLayoutGraph);
+        connect(m_snapBtn,     &QPushButton::toggled,  this, &OghamStoryteller::OnSnapToggle);
+        connect(m_treeSearch,  &QLineEdit::textChanged, this, &OghamStoryteller::OnTreeSearch);
         connect(m_playFromNodeBtn, &QPushButton::clicked, this, &OghamStoryteller::OnPlayFromNode);
-        connect(m_tagCombo,    &QComboBox::editTextChanged, this, &OghamStoryteller::OnTagEdited);
-
-        // ── Tag rename propagation: fires when user commits the tag field ─────
-        connect(m_tagCombo->lineEdit(), &QLineEdit::editingFinished, this,
-            [this]()
-            {
-                if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-                const QString newTag = m_tagCombo->currentText();
-                if (!IsValidTagStructure(newTag) || newTag == m_renamedFromTag) return;
-                const QString oldTag = m_renamedFromTag;
-                int refCount = 0;
-                for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
-                {
-                    auto& lf = m_loadedFiles[fi];
-                    bool changed = false;
-                    for (auto& e : lf.entries)
-                    {
-                        for (auto& opt : e.options)
-                        {
-                            if (opt.targetTag == oldTag)
-                            {
-                                opt.targetTag = newTag;
-                                ++refCount;
-                                changed = true;
-                            }
-                        }
-                    }
-                    // Rename alias pins on the renamed entry that carry the old tag as prefix
-                    if (fi == m_selectedFileIdx)
-                    {
-                        auto& entry = lf.entries[m_selectedEntryIdx];
-                        for (auto& ap : entry.aliasPins)
-                        {
-                            if (ap.tag == oldTag)
-                            {
-                                ap.tag = newTag;
-                                ++refCount;
-                                changed = true;
-                            }
-                            else if (ap.tag.startsWith(oldTag + "."))
-                            {
-                                ap.tag = newTag + ap.tag.mid(oldTag.size());
-                                ++refCount;
-                                changed = true;
-                            }
-                        }
-                    }
-                    if (changed)
-                        SetFileDirty(fi, true);
-                }
-                m_renamedFromTag = newTag;
-                if (refCount > 0)
-                {
-                    RebuildGraph();
-                    m_statusLabel->setText(
-                        QString("Updated %1 reference(s) to '%2'.").arg(refCount).arg(newTag));
-                }
-            });
 
         connect(m_tree, &QTreeWidget::currentItemChanged,
             [this](QTreeWidgetItem* current, QTreeWidgetItem*)
@@ -550,8 +1386,32 @@ namespace FoundationOgham
             this, &OghamStoryteller::OnPinDroppedOnCanvas);
         connect(m_graphView, &OghamGraphView::deleteNodeRequested,
             this, &OghamStoryteller::OnDeleteNodeFromGraph);
+        connect(m_graphView, &OghamGraphView::deleteNodesRequested,
+            this, &OghamStoryteller::OnDeleteNodesFromGraph);
         connect(m_graphView, &OghamGraphView::deleteAliasPinRequested,
             this, &OghamStoryteller::OnDeleteAliasPin);
+        connect(m_graphView, &OghamGraphView::deleteAliasPinsRequested,
+            this, [this](const QList<QPair<QPair<int,int>,int>>& pins)
+            {
+                for (const auto& p : pins)
+                    OnDeleteAliasPin(p.first.first, p.first.second, p.second);
+            });
+        connect(m_graphView, &OghamGraphView::rubberBandStarted,
+            [this]() { m_suppressFormOnSelect = true; });
+        connect(m_graphView, &OghamGraphView::rubberBandEnded,
+            [this]()
+            {
+                m_suppressFormOnSelect = false;
+                const auto sel = m_graphView->graphScene()->selectedItems();
+                if (sel.size() == 1)
+                {
+                    if (auto* node = dynamic_cast<OghamNodeItem*>(sel.first()))
+                    {
+                        PopulateForm(node->fileIdx(), node->entryIdx());
+                        SelectEntry(node->fileIdx(), node->entryIdx());
+                    }
+                }
+            });
         connect(m_graphView, &OghamGraphView::createNodeRequested,
             this, &OghamStoryteller::OnCreateNodeFromCanvas);
         connect(m_graphView, &OghamGraphView::pinDragStarted,
@@ -597,23 +1457,41 @@ namespace FoundationOgham
         if (cfg.contains("splitterState"))
             m_splitter->restoreState(cfg.value("splitterState").toByteArray());
         else
-            m_splitter->setSizes({ 200, 800 });   // first launch: tree 200px
-        if (cfg.contains("innerSplitterState"))
-            m_innerSplitter->restoreState(cfg.value("innerSplitterState").toByteArray());
-        else
-            m_innerSplitter->setSizes({ 500, 500 }); // first launch: graph 1:1 form
+            m_splitter->setSizes({ 200, 800 });
 
         EnsureOghamTagsFile();
         ScanAndLoadAll();
+        LoadGraphMeta();
         RebuildTree();
         UpdateStatusBar();
     }
 
     void OghamStoryteller::closeEvent(QCloseEvent* event)
     {
+        // Warn about unsaved changes
+        int dirtyCount = 0;
+        for (const auto& lf : m_loadedFiles)
+            if (lf.dirty) ++dirtyCount;
+
+        if (dirtyCount > 0)
+        {
+            const auto reply = QMessageBox::question(this,
+                "Unsaved Changes",
+                QString("%1 file(s) have unsaved changes.\n"
+                        "Save before closing?").arg(dirtyCount),
+                QMessageBox::Save | QMessageBox::Discard | QMessageBox::Cancel);
+
+            if (reply == QMessageBox::Cancel)
+            {
+                event->ignore();
+                return;
+            }
+            if (reply == QMessageBox::Save)
+                OnSaveAll();
+        }
+
         QSettings cfg("HeathenEngineering", "OghamStoryteller");
-        cfg.setValue("splitterState",      m_splitter->saveState());
-        cfg.setValue("innerSplitterState", m_innerSplitter->saveState());
+        cfg.setValue("splitterState", m_splitter->saveState());
         QWidget::closeEvent(event);
     }
 
@@ -945,60 +1823,69 @@ namespace FoundationOgham
         });
     }
 
-    void OghamStoryteller::OnTagEdited()
+
+    int OghamStoryteller::PropagateTagRename(const QString& oldTag, const QString& newTag,
+                                              int srcFi, int srcEi)
     {
-        if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-        auto& entry = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-        entry.tag = m_tagCombo->currentText();
-        SetFileDirty(m_selectedFileIdx, true);
-
-        // Update tristate status
-        ApplyTagStatus(m_tagStatus, entry.tag, FetchKnownOghamTags());
-
-        // Connect status button click to add-to-gptags
-        disconnect(m_tagStatus, nullptr, nullptr, nullptr);
-        if (m_tagStatus->isEnabled())
+        int refCount = 0;
+        for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
         {
-            connect(m_tagStatus, &QToolButton::clicked,
-                [this]()
+            auto& lf = m_loadedFiles[fi];
+            bool changed = false;
+            for (auto& e : lf.entries)
+            {
+                for (auto& opt : e.options)
                 {
-                    if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-                    const QString tag =
-                        m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx].tag;
-                    AddTagToGptagsFile(tag);
-                    ApplyTagStatus(m_tagStatus, tag, FetchKnownOghamTags());
-                    disconnect(m_tagStatus, nullptr, nullptr, nullptr);
-                });
+                    if (opt.targetTag == oldTag)
+                    {
+                        opt.targetTag = newTag;
+                        ++refCount;
+                        changed = true;
+                    }
+                }
+            }
+            if (fi == srcFi && srcEi >= 0 && srcEi < lf.entries.size())
+            {
+                for (auto& ap : lf.entries[srcEi].aliasPins)
+                {
+                    if (ap.tag == oldTag)
+                    { ap.tag = newTag; ++refCount; changed = true; }
+                    else if (ap.tag.startsWith(oldTag + "."))
+                    { ap.tag = newTag + ap.tag.mid(oldTag.size()); ++refCount; changed = true; }
+                }
+            }
+            if (changed) SetFileDirty(fi, true);
         }
+        return refCount;
+    }
 
-        // Refresh the tree item label without full rebuild
-        QTreeWidgetItem* cur = m_tree->currentItem();
-        if (cur && cur->data(0, kRoleEntryIdx).toInt() == m_selectedEntryIdx)
+    int OghamStoryteller::CascadeDescendantRename(const QString& oldPrefix,
+                                                   const QString& newPrefix)
+    {
+        const QString prefixDot = oldPrefix + ".";
+        QMap<QString, QString> renames;
+        for (const auto& lf : m_loadedFiles)
+            for (const auto& e : lf.entries)
+                if (e.tag.startsWith(prefixDot))
+                    renames[e.tag] = newPrefix + e.tag.mid(oldPrefix.length());
+        if (renames.isEmpty()) return 0;
+
+        int refCount = 0;
+        for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
         {
-            int dot = entry.tag.lastIndexOf('.');
-            cur->setText(0, dot < 0 ? entry.tag : entry.tag.mid(dot + 1));
-            cur->setData(0, kRoleNodeTag, entry.tag);
+            auto& lf = m_loadedFiles[fi];
+            bool changed = false;
+            for (auto& e : lf.entries)
+            {
+                if (renames.contains(e.tag))
+                { e.tag = renames[e.tag]; ++refCount; changed = true; }
+                for (auto& opt : e.options)
+                    if (renames.contains(opt.targetTag))
+                    { opt.targetTag = renames[opt.targetTag]; ++refCount; changed = true; }
+            }
+            if (changed) SetFileDirty(fi, true);
         }
-    }
-
-    void OghamStoryteller::OnAddTextKey()
-    {
-        if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-        m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx].dataKeys.append("");
-        SetFileDirty(m_selectedFileIdx, true);
-        RebuildTextKeysArea();
-    }
-
-    void OghamStoryteller::OnAddOption()
-    {
-        if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-        auto& entry = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-        OghamSourceOption opt;
-        opt.tag = entry.tag + ".Option" +
-                  QString::number(entry.options.size() + 1);
-        entry.options.append(opt);
-        SetFileDirty(m_selectedFileIdx, true);
-        RebuildOptionsArea();
+        return refCount;
     }
 
     // -------------------------------------------------------------------------
@@ -1009,6 +1896,13 @@ namespace FoundationOgham
     {
         AZ::IO::FixedMaxPath projectPath = AZ::Utils::GetProjectPath();
         if (projectPath.empty()) return;
+
+        // Derive the graph meta path from the project root (editor-only metadata)
+        if (m_graphMetaPath.isEmpty())
+        {
+            const QString projectDir = QString::fromUtf8(projectPath.c_str());
+            m_graphMetaPath = projectDir + "/Assets/Storyteller/graph.ogmgraph";
+        }
 
         // Use QDirIterator directly on the real filesystem path so stored paths
         // are always plain OS paths, never @projectroot@ aliases.
@@ -1226,6 +2120,7 @@ namespace FoundationOgham
                                          ? oo["targetTag"].toString()
                                          : oo["targetEntry"].toString();
                 opt.targetAliasIndex = oo["targetAliasIndex"].toInt(0);
+                opt.displayAsTab     = oo["displayAsTab"].toBool(false);
                 const QJsonArray rds = oo["redirects"].toArray();
                 for (const QJsonValue& rv : rds)
                     if (rv.isObject()) opt.redirects.append(ParsePoint(rv.toObject()));
@@ -1233,6 +2128,20 @@ namespace FoundationOgham
                 opt.operations  = ParseOperations(oo["operations"].toArray());
                 entry.options.append(opt);
             }
+
+            // Label IDs and highlight color (editor-only, absent in older files)
+            if (eo.contains("labelIds"))
+            {
+                for (const QJsonValue lv : eo["labelIds"].toArray())
+                    entry.labelIds.append(lv.toInt());
+            }
+            if (eo.contains("highlightColor"))
+            {
+                const QString hc = eo["highlightColor"].toString();
+                if (!hc.isEmpty())
+                    entry.highlightColor = QColor(hc);
+            }
+
             lf.entries.append(entry);
         }
         return true;
@@ -1271,6 +2180,7 @@ namespace FoundationOgham
                 oo["textKey"]          = opt.textKey;
                 oo["targetTag"]        = opt.targetTag;
                 oo["targetAliasIndex"] = opt.targetAliasIndex;
+                if (opt.displayAsTab) oo["displayAsTab"] = true;
                 QJsonArray rdsArr;
                 for (const QPointF& rd : opt.redirects) rdsArr.append(SerialisePoint(rd));
                 oo["redirects"]   = rdsArr;
@@ -1279,6 +2189,17 @@ namespace FoundationOgham
                 optsArr.append(oo);
             }
             eo["options"] = optsArr;
+
+            // Editor-only: label IDs and highlight color
+            if (!entry.labelIds.isEmpty())
+            {
+                QJsonArray lidsArr;
+                for (int lid : entry.labelIds) lidsArr.append(lid);
+                eo["labelIds"] = lidsArr;
+            }
+            if (entry.highlightColor.isValid())
+                eo["highlightColor"] = entry.highlightColor.name();
+
             entriesArr.append(eo);
         }
 
@@ -1378,6 +2299,53 @@ namespace FoundationOgham
         return {};
     }
 
+    QString OghamStoryteller::FindPrimaryLexiconPath() const
+    {
+        AZStd::vector<AZStd::string> azPaths;
+        FoundationLocalisation::LexiconEditorRequestBus::BroadcastResult(
+            azPaths, &FoundationLocalisation::LexiconEditorRequests::GetKnownFilePaths);
+        if (azPaths.empty()) return {};
+
+        auto* fileIO = AZ::IO::FileIOBase::GetInstance();
+        QString chosen;
+        for (const auto& p : azPaths)
+        {
+            AZ::IO::FixedMaxPath resolved;
+            const QString qp = (fileIO && fileIO->ResolvePath(resolved, p.c_str()))
+                ? QString::fromUtf8(resolved.c_str())
+                : QString::fromUtf8(p.c_str());
+            if (QFileInfo(qp).baseName().compare("default", Qt::CaseInsensitive) == 0)
+                return qp;
+            if (chosen.isEmpty()) chosen = qp;
+        }
+        return chosen;
+    }
+
+    bool OghamStoryteller::WriteLexiconEntry(const QString& key, const QString& value)
+    {
+        const QString path = FindPrimaryLexiconPath();
+        if (path.isEmpty()) return false;
+
+        QFile f(path);
+        if (!f.open(QIODevice::ReadOnly)) return false;
+        QJsonParseError err;
+        QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
+        f.close();
+        if (err.error != QJsonParseError::NoError) return false;
+
+        QJsonObject root    = doc.object();
+        QJsonObject entries = root["entries"].toObject();
+        entries[key]        = value;
+        root["entries"]     = entries;
+
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return false;
+        f.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+
+        FoundationLocalisation::LexiconEditorRequestBus::Broadcast(
+            &FoundationLocalisation::LexiconEditorRequests::RefreshKeyTree);
+        return true;
+    }
+
     void OghamStoryteller::ShowAddKeyDialog(const QString& suggestedKey,
                                              const QString& suggestedValue)
     {
@@ -1447,7 +2415,194 @@ namespace FoundationOgham
         if (written > 1) msg += "\n\nRemember to update non-primary Lexicons.";
 
         QMessageBox::information(this, "Key Added", msg);
-        RebuildTextKeysArea();
+    }
+
+    // -------------------------------------------------------------------------
+    // Inline data-key editing (node hover-reveal buttons)
+    // -------------------------------------------------------------------------
+
+    void OghamStoryteller::ShowLexiconFieldModal(int fi, int ei, int rowIdx, QPoint screenPos)
+    {
+        if (fi < 0 || fi >= m_loadedFiles.size()) return;
+        auto& entries = m_loadedFiles[fi].entries;
+        if (ei < 0 || ei >= entries.size()) return;
+        auto& entry = entries[ei];
+        if (rowIdx < 0 || rowIdx >= entry.dataKeys.size()) return;
+
+        const QString currentKey = entry.dataKeys[rowIdx];
+        const QStringList known  = FetchKnownLexiconKeys();
+        auto fetchVal = [this](const QString& k){ return FetchLexiconValueForKey(k); };
+
+        LexiconFieldModal dlg(currentKey, known, fetchVal, this);
+        dlg.adjustSize();
+        dlg.move(ModalPos(screenPos, dlg));
+
+        if (dlg.exec() != QDialog::Accepted) return;
+
+        const LexiconFieldModal::Result res = dlg.result();
+        if (res.action == LexiconFieldModal::Action::None) return;
+
+        // Update the key in the data model for Assign/Create/Update
+        if (res.action != LexiconFieldModal::Action::Update)
+        {
+            entry.dataKeys[rowIdx] = res.key;
+            SetFileDirty(fi, true);
+        }
+
+        // Write to the lexicon when the value changes (Create or Update)
+        if (res.action == LexiconFieldModal::Action::Create ||
+            res.action == LexiconFieldModal::Action::Update)
+        {
+            if (!res.key.isEmpty())
+                WriteLexiconEntry(res.key, res.value);
+        }
+
+        RebuildGraph();
+    }
+
+    void OghamStoryteller::AddDataKey(int fi, int ei, QPoint screenPos)
+    {
+        if (fi < 0 || fi >= m_loadedFiles.size()) return;
+        auto& entries = m_loadedFiles[fi].entries;
+        if (ei < 0 || ei >= entries.size()) return;
+
+        entries[ei].dataKeys.append(QString());
+        SetFileDirty(fi, true);
+        RebuildGraph();
+
+        // Open the modal immediately on the newly created (last) row.
+        const int newRowIdx = entries[ei].dataKeys.size() - 1;
+        ShowLexiconFieldModal(fi, ei, newRowIdx, screenPos);
+    }
+
+    void OghamStoryteller::RemoveDataKey(int fi, int ei, int rowIdx)
+    {
+        if (fi < 0 || fi >= m_loadedFiles.size()) return;
+        auto& entries = m_loadedFiles[fi].entries;
+        if (ei < 0 || ei >= entries.size()) return;
+        if (rowIdx < 0 || rowIdx >= entries[ei].dataKeys.size()) return;
+
+        entries[ei].dataKeys.removeAt(rowIdx);
+        SetFileDirty(fi, true);
+        RebuildGraph();
+    }
+
+    // ── Operations (section 0) ───────────────────────────────────────────────
+
+    static QPoint ModalPos(QPoint screenPos, const QDialog& dlg)
+    {
+        const QRect screen = QApplication::primaryScreen()
+            ? QApplication::primaryScreen()->availableGeometry()
+            : QRect(0, 0, 1920, 1080);
+        QPoint pos = screenPos - QPoint(dlg.width() / 2, 0);
+        pos.setX(qBound(screen.left(), pos.x(), screen.right()  - dlg.width()));
+        pos.setY(qBound(screen.top(),  pos.y(), screen.bottom() - dlg.height()));
+        return pos;
+    }
+
+    void OghamStoryteller::ShowOperationModal(int fi, int ei, int row, QPoint screenPos)
+    {
+        if (fi < 0 || fi >= m_loadedFiles.size()) return;
+        auto& entries = m_loadedFiles[fi].entries;
+        if (ei < 0 || ei >= entries.size()) return;
+        auto& entOps = entries[ei].entryOperations;
+        if (row < 0 || row >= entOps.size()) return;
+
+        auto addTagFn = [this](const QString& tag, QToolButton* btn)
+        { ShowAddTagDialog(tag, btn); };
+
+        OperationEditorModal dlg(entOps[row], FetchAllTagsFromAllFiles(), addTagFn, this);
+        dlg.adjustSize();
+        dlg.move(ModalPos(screenPos, dlg));
+        if (dlg.exec() != QDialog::Accepted) return;
+
+        entOps[row] = dlg.result();
+        SetFileDirty(fi, true);
+        RebuildGraph();
+    }
+
+    void OghamStoryteller::AddEntryOperation(int fi, int ei, QPoint screenPos)
+    {
+        if (fi < 0 || fi >= m_loadedFiles.size()) return;
+        auto& entries = m_loadedFiles[fi].entries;
+        if (ei < 0 || ei >= entries.size()) return;
+
+        entries[ei].entryOperations.append(OghamOperation{});
+        SetFileDirty(fi, true);
+        RebuildGraph();
+        ShowOperationModal(fi, ei, entries[ei].entryOperations.size() - 1, screenPos);
+    }
+
+    void OghamStoryteller::RemoveEntryOperation(int fi, int ei, int row)
+    {
+        if (fi < 0 || fi >= m_loadedFiles.size()) return;
+        auto& entries = m_loadedFiles[fi].entries;
+        if (ei < 0 || ei >= entries.size()) return;
+        if (row < 0 || row >= entries[ei].entryOperations.size()) return;
+
+        entries[ei].entryOperations.removeAt(row);
+        SetFileDirty(fi, true);
+        RebuildGraph();
+    }
+
+    // ── Options / Choices (section 2) ────────────────────────────────────────
+
+    void OghamStoryteller::ShowOptionModal(int fi, int ei, int row, QPoint screenPos)
+    {
+        if (fi < 0 || fi >= m_loadedFiles.size()) return;
+        auto& entries = m_loadedFiles[fi].entries;
+        if (ei < 0 || ei >= entries.size()) return;
+        auto& opts = entries[ei].options;
+        if (row < 0 || row >= opts.size()) return;
+
+        auto addTagFn   = [this](const QString& tag, QToolButton* btn)
+        { ShowAddTagDialog(tag, btn); };
+        auto fetchLexFn = [this](const QString& key){ return FetchLexiconValueForKey(key); };
+
+        OptionEditorModal dlg(
+            opts[row],
+            FetchKnownLexiconKeys(),
+            FetchAllTagsFromAllFiles(),
+            addTagFn,
+            fetchLexFn,
+            this);
+        dlg.adjustSize();
+        dlg.move(ModalPos(screenPos, dlg));
+        if (dlg.exec() != QDialog::Accepted) return;
+
+        OghamSourceOption updated = dlg.result();
+        updated.redirects        = opts[row].redirects;   // preserve graph reroute points
+        // Preserve fields not shown in this modal
+        updated.targetTag        = opts[row].targetTag;
+        updated.targetAliasIndex = opts[row].targetAliasIndex;
+        updated.displayAsTab     = opts[row].displayAsTab;
+        opts[row] = updated;
+        SetFileDirty(fi, true);
+        RebuildGraph();
+    }
+
+    void OghamStoryteller::AddEntryOption(int fi, int ei, QPoint screenPos)
+    {
+        if (fi < 0 || fi >= m_loadedFiles.size()) return;
+        auto& entries = m_loadedFiles[fi].entries;
+        if (ei < 0 || ei >= entries.size()) return;
+
+        entries[ei].options.append(OghamSourceOption{});
+        SetFileDirty(fi, true);
+        RebuildGraph();
+        ShowOptionModal(fi, ei, entries[ei].options.size() - 1, screenPos);
+    }
+
+    void OghamStoryteller::RemoveEntryOption(int fi, int ei, int row)
+    {
+        if (fi < 0 || fi >= m_loadedFiles.size()) return;
+        auto& entries = m_loadedFiles[fi].entries;
+        if (ei < 0 || ei >= entries.size()) return;
+        if (row < 0 || row >= entries[ei].options.size()) return;
+
+        entries[ei].options.removeAt(row);
+        SetFileDirty(fi, true);
+        RebuildGraph();
     }
 
     // -------------------------------------------------------------------------
@@ -1918,10 +3073,18 @@ namespace FoundationOgham
     void OghamStoryteller::RebuildGraph()
     {
         QGraphicsScene* scene = m_graphView->graphScene();
+
+        // Preserve selection across rebuild
+        QSet<QString> previouslySelected;
+        for (const QGraphicsItem* item : scene->selectedItems())
+            if (const auto* node = dynamic_cast<const OghamNodeItem*>(item))
+                previouslySelected.insert(node->tag());
+
         scene->clear();
 
         // ── Phase 1: create nodes and build tag lookup ────────────────────────
         QMap<QString, OghamNodeItem*> tagToNode;
+        const QStringList knownOghamTags = FetchKnownOghamTags();
 
         for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
         {
@@ -1930,23 +3093,55 @@ namespace FoundationOgham
             {
                 const OghamSourceEntry& entry = lf.entries[ei];
 
-                QStringList optTags;
+                QStringList optLabels;
                 for (const OghamSourceOption& opt : entry.options)
                 {
                     const QString lexVal = opt.textKey.isEmpty() ? QString()
                                         : FetchLexiconValueForKey(opt.textKey);
-                    optTags.append(opt.tag.isEmpty()
-                        ? (lexVal.isEmpty() ? opt.textKey : lexVal)
-                        : opt.tag);
+                    // Display the resolved localised string; fall back to key then tag
+                    optLabels.append(!lexVal.isEmpty()      ? lexVal
+                                   : !opt.textKey.isEmpty() ? opt.textKey
+                                   : opt.tag);
+                }
+
+                QStringList opLabels;
+                for (const OghamOperation& op : entry.entryOperations)
+                    opLabels.append(op.tag + QStringLiteral(" ") + op.arithmetic
+                                    + QStringLiteral(" ") + QString::number(op.value));
+
+                QStringList dataLabels;
+                for (const QString& key : entry.dataKeys)
+                {
+                    const QString val = key.isEmpty() ? QString() : FetchLexiconValueForKey(key);
+                    dataLabels.append(val.isEmpty() ? key : val);
+                }
+
+                const bool tagInReg = knownOghamTags.contains(entry.tag);
+
+                // Resolve label IDs → display data for this entry
+                OghamNodeItem::LabelData assignedLabels;
+                for (int lid : entry.labelIds)
+                {
+                    for (const OghamLabel& lbl : m_graphLabels)
+                    {
+                        if (lbl.id == lid)
+                        {
+                            assignedLabels.append({lbl.color, lbl.name});
+                            break;
+                        }
+                    }
                 }
 
                 const QColor hdrColor = m_loadedFiles[fi].fileColor.isValid()
                     ? m_loadedFiles[fi].fileColor
                     : kGraphFileColors[fi % kGraphFileColorCount];
-                auto* node = new OghamNodeItem(fi, ei, entry.tag, optTags, hdrColor);
+                auto* node = new OghamNodeItem(fi, ei, entry.tag, tagInReg,
+                    opLabels, entry.dataKeys, dataLabels, optLabels,
+                    assignedLabels, entry.highlightColor, hdrColor);
 
                 node->setPos(entry.position);
 
+                node->setSnapToGrid(m_snapToGrid);
                 scene->addItem(node);
                 if (!entry.tag.isEmpty())
                     tagToNode[entry.tag] = node;
@@ -1964,21 +3159,157 @@ namespace FoundationOgham
                 connect(node, &OghamNodeItem::entrySelected,
                     [this](int nfi, int nei)
                     {
-                        PopulateForm(nfi, nei);
-                        SelectEntry(nfi, nei);
+                        if (!m_suppressFormOnSelect)
+                        {
+                            PopulateForm(nfi, nei);
+                            SelectEntry(nfi, nei);
+                        }
                     });
 
                 connect(node, &OghamNodeItem::grabStarted,
                     [this](int, int) { m_isInteracting = true; });
                 connect(node, &OghamNodeItem::grabEnded,
-                    [this](int, int) { m_isInteracting = false; TrySave(); });
+                    [this](int, int) { m_isInteracting = false; });
 
                 connect(node, &OghamNodeItem::createAliasPinRequested,
                     this, &OghamStoryteller::OnCreateAliasPin);
+                connect(node, &OghamNodeItem::cascadeFromNodeRequested,
+                    this, &OghamStoryteller::OnCascadeFromNode);
                 connect(node, &OghamNodeItem::duplicateNodeRequested,
                     this, &OghamStoryteller::OnDuplicateNode);
                 connect(node, &OghamNodeItem::deleteNodeRequested,
                     this, &OghamStoryteller::OnDeleteNodeFromGraph);
+
+                connect(node, &OghamNodeItem::tagStatusClicked,
+                    [this](int nfi, int nei, QPoint)
+                    {
+                        if (nfi < 0 || nfi >= m_loadedFiles.size()) return;
+                        if (nei < 0 || nei >= m_loadedFiles[nfi].entries.size()) return;
+                        ShowAddTagDialog(m_loadedFiles[nfi].entries[nei].tag, nullptr);
+                        RebuildGraph();
+                    });
+
+                connect(node, &OghamNodeItem::tagRenameRequested,
+                    [this](int nfi, int nei, QPoint)
+                    {
+                        if (nfi < 0 || nfi >= m_loadedFiles.size()) return;
+                        if (nei < 0 || nei >= m_loadedFiles[nfi].entries.size()) return;
+                        const QString oldTag = m_loadedFiles[nfi].entries[nei].tag;
+
+                        bool ok = false;
+                        const QString input = QInputDialog::getText(
+                            this, "Rename Entry", "New tag:", QLineEdit::Normal, oldTag, &ok);
+                        if (!ok) return;
+                        const QString newTag = input.trimmed();
+                        if (newTag == oldTag || !IsValidTagStructure(newTag)) return;
+
+                        m_loadedFiles[nfi].entries[nei].tag = newTag;
+                        SetFileDirty(nfi, true);
+                        const int refs = PropagateTagRename(oldTag, newTag, nfi, nei);
+                        if (m_selectedFileIdx == nfi && m_selectedEntryIdx == nei)
+                            m_renamedFromTag = newTag;
+
+                        int cascadeRefs = 0;
+                        {
+                            const QString pfx = oldTag + ".";
+                            int descCount = 0;
+                            for (const auto& lf : m_loadedFiles)
+                                for (const auto& e : lf.entries)
+                                    if (e.tag.startsWith(pfx)) ++descCount;
+                            if (descCount > 0)
+                            {
+                                const auto reply = QMessageBox::question(this, "Cascade Rename",
+                                    QString("%1 child entr(ies) share the '%2.' prefix.\n"
+                                            "Rename them to '%3.'?")
+                                        .arg(descCount).arg(oldTag).arg(newTag),
+                                    QMessageBox::Yes | QMessageBox::No);
+                                if (reply == QMessageBox::Yes)
+                                    cascadeRefs = CascadeDescendantRename(oldTag, newTag);
+                            }
+                        }
+
+                        RebuildGraph();
+                        RebuildTree();
+                        QString msg = QString("Renamed '%1' \xe2\x86\x92 '%2' (%3 ref(s) updated).")
+                            .arg(oldTag, newTag).arg(refs);
+                        if (cascadeRefs > 0)
+                            msg += QString(" Cascade: %1 item(s) renamed.").arg(cascadeRefs);
+                        m_statusLabel->setText(msg);
+                    });
+
+                connect(node, &OghamNodeItem::fieldClicked,
+                    [this](int nfi, int nei, int sec, int row, QPoint sp)
+                    {
+                        if      (sec == 0) ShowOperationModal(nfi, nei, row, sp);
+                        else if (sec == 1) ShowLexiconFieldModal(nfi, nei, row, sp);
+                        else if (sec == 2) ShowOptionModal(nfi, nei, row, sp);
+                    });
+                connect(node, &OghamNodeItem::sectionAddClicked,
+                    [this](int nfi, int nei, int sec, QPoint sp)
+                    {
+                        if      (sec == 0) AddEntryOperation(nfi, nei, sp);
+                        else if (sec == 1) AddDataKey(nfi, nei, sp);
+                        else if (sec == 2) AddEntryOption(nfi, nei, sp);
+                    });
+                connect(node, &OghamNodeItem::rowRemoveClicked,
+                    [this](int nfi, int nei, int sec, int row)
+                    {
+                        if      (sec == 0) RemoveEntryOperation(nfi, nei, row);
+                        else if (sec == 1) RemoveDataKey(nfi, nei, row);
+                        else if (sec == 2) RemoveEntryOption(nfi, nei, row);
+                    });
+
+                connect(node, &OghamNodeItem::addLabelRequested,
+                    [this](int nfi, int nei, QPoint sp)
+                    { ShowLabelModal(nfi, nei, sp); });
+                connect(node, &OghamNodeItem::setHighlightColorRequested,
+                    [this](int nfi, int nei)
+                    { ShowHighlightColorPicker(nfi, nei); });
+                connect(node, &OghamNodeItem::clearHighlightColorRequested,
+                    [this](int nfi, int nei)
+                    {
+                        if (nfi < 0 || nfi >= m_loadedFiles.size()) return;
+                        auto& entries = m_loadedFiles[nfi].entries;
+                        if (nei < 0 || nei >= entries.size()) return;
+                        entries[nei].highlightColor = QColor();
+                        SetFileDirty(nfi, true);
+                        RebuildGraph();
+                    });
+                connect(node, &OghamNodeItem::rowMoveUpClicked,
+                    [this](int nfi, int nei, int sec, int row)
+                    {
+                        if (nfi < 0 || nfi >= m_loadedFiles.size()) return;
+                        auto& entries = m_loadedFiles[nfi].entries;
+                        if (nei < 0 || nei >= entries.size() || row <= 0) return;
+                        auto& e = entries[nei];
+                        if      (sec == 0 && row < e.entryOperations.size())
+                            { e.entryOperations.move(row, row - 1); SetFileDirty(nfi, true); RebuildGraph(); }
+                        else if (sec == 1 && row < e.dataKeys.size())
+                            { e.dataKeys.move(row, row - 1);        SetFileDirty(nfi, true); RebuildGraph(); }
+                        else if (sec == 2 && row < e.options.size())
+                            { e.options.move(row, row - 1);         SetFileDirty(nfi, true); RebuildGraph(); }
+                    });
+                connect(node, &OghamNodeItem::rowMoveDownClicked,
+                    [this](int nfi, int nei, int sec, int row)
+                    {
+                        if (nfi < 0 || nfi >= m_loadedFiles.size()) return;
+                        auto& entries = m_loadedFiles[nfi].entries;
+                        if (nei < 0 || nei >= entries.size() || row < 0) return;
+                        auto& e = entries[nei];
+                        if      (sec == 0 && row < e.entryOperations.size() - 1)
+                            { e.entryOperations.move(row, row + 1); SetFileDirty(nfi, true); RebuildGraph(); }
+                        else if (sec == 1 && row < e.dataKeys.size() - 1)
+                            { e.dataKeys.move(row, row + 1);        SetFileDirty(nfi, true); RebuildGraph(); }
+                        else if (sec == 2 && row < e.options.size() - 1)
+                            { e.options.move(row, row + 1);         SetFileDirty(nfi, true); RebuildGraph(); }
+                    });
+                connect(node, &OghamNodeItem::labelPillClicked,
+                    [this]()
+                    {
+                        OghamNodeItem::s_labelsExpanded = !OghamNodeItem::s_labelsExpanded;
+                        if (m_graphView && m_graphView->graphScene())
+                            m_graphView->graphScene()->update();
+                    });
             }
         }
 
@@ -2071,9 +3402,18 @@ namespace FoundationOgham
                         OghamNodeItem* dstNode = tagToNode.value(opt.targetTag);
                         if (!dstNode) continue;
 
+                        // Look up destination highlight color from data model
+                        const int dfi = dstNode->fileIdx();
+                        const int dei = dstNode->entryIdx();
+                        const QColor dstHL = (dfi >= 0 && dfi < m_loadedFiles.size() &&
+                                              dei >= 0 && dei < m_loadedFiles[dfi].entries.size())
+                            ? m_loadedFiles[dfi].entries[dei].highlightColor
+                            : QColor();
+
                         conn = new OghamConnectionItem(srcNode, oi,
                             [dstNode]() { return dstNode->inputPinScenePos(); },
-                            opt.redirects, dstNode->fileIdx());
+                            opt.redirects, opt.targetTag, opt.displayAsTab,
+                            dstNode->fileIdx(), dstHL);
 
                         connect(dstNode, &OghamNodeItem::positionChanged, conn,
                             [conn](int, int, QPointF) { conn->refreshPath(); });
@@ -2086,11 +3426,16 @@ namespace FoundationOgham
 
                         conn = new OghamConnectionItem(srcNode, oi,
                             [ap]() { return ap->inputPinScenePos(); },
-                            opt.redirects, ap->fileIdx());
+                            opt.redirects, opt.targetTag, opt.displayAsTab,
+                            ap->fileIdx());
 
                         connect(ap, &OghamAliasPinItem::positionChanged, conn,
                             [conn](QPointF) { conn->refreshPath(); });
                     }
+
+                    // When the source node's sections expand/collapse, output pin positions change.
+                    connect(srcNode, &OghamNodeItem::layoutChanged, conn,
+                        [conn](int, int) { conn->refreshPath(); });
 
                     scene->addItem(conn);
 
@@ -2105,6 +3450,84 @@ namespace FoundationOgham
                             entries[ei].options[oi].redirects = rds;
                             SetFileDirty(fi, true);
                         });
+
+                    // Persist wire↔tab mode toggle
+                    connect(conn, &OghamConnectionItem::displayModeChanged,
+                        this, [this, fi, ei, oi](bool asTab)
+                        {
+                            if (fi < 0 || fi >= m_loadedFiles.size()) return;
+                            auto& entries = m_loadedFiles[fi].entries;
+                            if (ei < 0 || ei >= entries.size()) return;
+                            if (oi < 0 || oi >= entries[ei].options.size()) return;
+                            entries[ei].options[oi].displayAsTab = asTab;
+                            SetFileDirty(fi, true);
+                        });
+
+                    // Click on tab → select target node in the graph
+                    connect(conn, &OghamConnectionItem::tabClicked,
+                        this, [this](const QString& targetTag)
+                        {
+                            for (int nfi = 0; nfi < m_loadedFiles.size(); ++nfi)
+                            {
+                                const auto& entries = m_loadedFiles[nfi].entries;
+                                for (int nei = 0; nei < entries.size(); ++nei)
+                                {
+                                    if (entries[nei].tag != targetTag) continue;
+                                    PopulateForm(nfi, nei);
+                                    SelectEntry(nfi, nei);
+                                    for (QGraphicsItem* gi : m_graphView->graphScene()->items())
+                                    {
+                                        if (auto* n = dynamic_cast<OghamNodeItem*>(gi))
+                                        {
+                                            if (n->fileIdx() == nfi && n->entryIdx() == nei)
+                                            {
+                                                m_graphView->graphScene()->clearSelection();
+                                                n->setSelected(true);
+                                                m_graphView->centerOn(n);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    return;
+                                }
+                            }
+                        });
+                }
+            }
+        }
+
+        // ── Phase 3: restore graph selection ──────────────────────────────────────
+        if (!previouslySelected.isEmpty())
+        {
+            for (QGraphicsItem* item : scene->items())
+            {
+                if (auto* node = dynamic_cast<OghamNodeItem*>(item))
+                {
+                    if (previouslySelected.contains(node->tag()))
+                        node->setSelected(true);
+                }
+            }
+        }
+
+        // ── Phase 4: mark pin connection states (open vs filled triangle) ────────
+        for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
+        {
+            const LoadedFile& lf = m_loadedFiles[fi];
+            for (int ei = 0; ei < lf.entries.size(); ++ei)
+            {
+                OghamNodeItem* srcNode = tagToNode.value(lf.entries[ei].tag);
+                if (!srcNode) continue;
+
+                for (int oi = 0; oi < lf.entries[ei].options.size(); ++oi)
+                {
+                    const QString& dstTag = lf.entries[ei].options[oi].targetTag;
+                    if (dstTag.isEmpty()) continue;
+
+                    srcNode->setOutputConnected(oi, true);
+
+                    OghamNodeItem* dstNode = tagToNode.value(dstTag);
+                    if (dstNode)
+                        dstNode->setInputConnected(true);
                 }
             }
         }
@@ -2408,6 +3831,232 @@ namespace FoundationOgham
         SelectEntry(fileIdx, newEi);
     }
 
+    void OghamStoryteller::OnCascadeFromNode(int fi, int ei, QPoint /*screenPos*/)
+    {
+        if (fi < 0 || fi >= m_loadedFiles.size()) return;
+        auto& lf = m_loadedFiles[fi];
+        if (ei < 0 || ei >= lf.entries.size()) return;
+        const QString srcTag = lf.entries[ei].tag;
+
+        // ── Dialog ─────────────────────────────────────────────────────────────
+        QDialog dlg(this);
+        dlg.setWindowTitle(QStringLiteral("Create Cascade"));
+        dlg.setFixedWidth(400);
+        auto* vlay = new QVBoxLayout(&dlg);
+
+        vlay->addWidget(new QLabel(
+            "Split this node into a chain of N copies.\n"
+            "The original is renamed to <tag>.<suffix>.<N>; N-1 new nodes are\n"
+            "inserted before it, each with the same data fields.\n"
+            "You then manually reduce the text in each copy.", &dlg));
+
+        auto* formLay = new QFormLayout;
+
+        // Suggest the last dot-segment of the original tag as base, then add suffix
+        const int lastDot = srcTag.lastIndexOf(QLatin1Char('.'));
+        const QString defaultBase = (lastDot >= 0) ? srcTag.mid(lastDot + 1) : srcTag;
+
+        auto* suffixEdit = new QLineEdit(QStringLiteral("part"), &dlg);
+        suffixEdit->setPlaceholderText("e.g. part, line, beat");
+        auto* countSpin  = new QSpinBox(&dlg);
+        countSpin->setRange(2, 20);
+        countSpin->setValue(3);
+
+        formLay->addRow("Suffix:", suffixEdit);
+        formLay->addRow("Number of nodes (N):", countSpin);
+
+        // Preview label
+        auto* previewLabel = new QLabel(&dlg);
+        previewLabel->setStyleSheet("color: #888;");
+        auto updatePreview = [&]()
+        {
+            const QString suf = suffixEdit->text().trimmed();
+            const int     n   = countSpin->value();
+            if (!suf.isEmpty() && n >= 2)
+            {
+                previewLabel->setText(
+                    QString("e.g. %1.%2.001 \xe2\x86\x92 \xe2\x80\xa6 \xe2\x86\x92 %1.%2.%3")
+                        .arg(srcTag, suf).arg(n, 3, 10, QChar('0')));
+            }
+            else
+            {
+                previewLabel->setText("(enter suffix above)");
+            }
+        };
+        connect(suffixEdit, &QLineEdit::textChanged, [&](const QString&) { updatePreview(); });
+        connect(countSpin,  QOverload<int>::of(&QSpinBox::valueChanged), [&](int) { updatePreview(); });
+        updatePreview();
+
+        vlay->addLayout(formLay);
+        vlay->addWidget(previewLabel);
+
+        auto* btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+        connect(btns, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+        connect(btns, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+        vlay->addWidget(btns);
+
+        if (dlg.exec() != QDialog::Accepted) return;
+
+        const QString suffix = suffixEdit->text().trimmed();
+        const int     N      = countSpin->value();
+        if (suffix.isEmpty() || N < 2) return;
+
+        // ── Generate all N tags ─────────────────────────────────────────────────
+        // allTags[0..N-2] = new nodes; allTags[N-1] = renamed original
+        QStringList allTags;
+        allTags.reserve(N);
+        for (int i = 1; i <= N; ++i)
+            allTags.append(QString("%1.%2.%3").arg(srcTag, suffix).arg(i, 3, 10, QChar('0')));
+
+        // Collision check
+        for (const QString& t : allTags)
+        {
+            for (const auto& loadedFile : m_loadedFiles)
+                for (const auto& e : loadedFile.entries)
+                    if (e.tag == t)
+                    {
+                        QMessageBox::warning(this, "Tag Collision",
+                            QString("Tag '%1' already exists. Choose a different suffix.").arg(t));
+                        return;
+                    }
+        }
+
+        // ── Save original data fields before we mutate anything ─────────────────
+        const QStringList origDataKeys = lf.entries[ei].dataKeys;
+        const QPointF     srcPos       = lf.entries[ei].position;
+        static constexpr qreal kXGap  = OghamNodeItem::kNodeWidth + 60.0;
+
+        // ── Step 1: redirect all INCOMING connections to original → first new node ─
+        // Any option that previously targeted srcTag should now target allTags[0]
+        for (int f2 = 0; f2 < m_loadedFiles.size(); ++f2)
+        {
+            bool changed = false;
+            for (auto& entry : m_loadedFiles[f2].entries)
+            {
+                for (auto& opt : entry.options)
+                {
+                    if (opt.targetTag == srcTag)
+                    {
+                        opt.targetTag = allTags[0];
+                        changed = true;
+                    }
+                }
+            }
+            if (changed)
+                SetFileDirty(f2, true);
+        }
+
+        // ── Step 2: create N-1 new nodes ──────────────────────────────────────────
+        for (int i = 0; i < N - 1; ++i)
+        {
+            OghamSourceEntry entry;
+            entry.tag      = allTags[i];
+            entry.position = srcPos + QPointF(kXGap * (i + 1), 0.0);
+            entry.dataKeys = origDataKeys;     // copy data fields from original
+
+            // One choice pointing to the next in chain
+            OghamSourceOption opt;
+            opt.tag       = QStringLiteral("continue");
+            opt.targetTag = allTags[i + 1];    // next = new node or renamed original
+            entry.options.append(opt);
+
+            lf.entries.append(entry);
+        }
+
+        // ── Step 3: rename original to allTags[N-1] and move it ───────────────────
+        lf.entries[ei].tag      = allTags[N - 1];
+        lf.entries[ei].position = srcPos + QPointF(kXGap * N, 0.0);
+
+        // ── Step 4: finish ─────────────────────────────────────────────────────────
+        SetFileDirty(fi, true);
+        RebuildTree();
+        RebuildGraph();
+        m_statusLabel->setText(
+            QString("Cascade: %1 nodes created, '%2' renamed to '%3'.")
+                .arg(N - 1).arg(srcTag).arg(allTags[N - 1]));
+    }
+
+    void OghamStoryteller::OnDeleteNodesFromGraph(QList<QPair<int,int>> fileEntryPairs)
+    {
+        if (fileEntryPairs.isEmpty()) return;
+
+        // Collect all tags that will be removed so we can clear cross-references
+        QSet<QString> tagsToRemove;
+        for (const auto& [fi, ei] : fileEntryPairs)
+        {
+            if (fi >= 0 && fi < m_loadedFiles.size() &&
+                ei >= 0 && ei < m_loadedFiles[fi].entries.size())
+            {
+                tagsToRemove.insert(m_loadedFiles[fi].entries[ei].tag);
+            }
+        }
+
+        // Clear option targetTags pointing to any deleted entry across all files
+        for (int fi = 0; fi < m_loadedFiles.size(); ++fi)
+        {
+            bool changed = false;
+            for (auto& e : m_loadedFiles[fi].entries)
+            {
+                for (auto& opt : e.options)
+                {
+                    if (tagsToRemove.contains(opt.targetTag))
+                    {
+                        opt.targetTag        = QString();
+                        opt.targetAliasIndex = 0;
+                        changed = true;
+                    }
+                }
+            }
+            if (changed)
+                SetFileDirty(fi, true);
+        }
+
+        // Group by file, sort entry indices descending so removals don't shift subsequent indices
+        QMap<int, QList<int>> byFile;
+        for (const auto& [fi, ei] : fileEntryPairs)
+        {
+            if (fi >= 0 && fi < m_loadedFiles.size() &&
+                ei >= 0 && ei < m_loadedFiles[fi].entries.size())
+            {
+                byFile[fi].append(ei);
+            }
+        }
+        for (auto& indices : byFile)
+            std::sort(indices.begin(), indices.end(), std::greater<int>());
+
+        for (auto it = byFile.constBegin(); it != byFile.constEnd(); ++it)
+        {
+            const int fi = it.key();
+            auto& entries = m_loadedFiles[fi].entries;
+            for (int ei : it.value())
+            {
+                entries.removeAt(ei);
+
+                // Keep selected entry pointer consistent
+                if (m_selectedFileIdx == fi)
+                {
+                    if (m_selectedEntryIdx == ei)
+                    {
+                        m_selectedFileIdx  = -1;
+                        m_selectedEntryIdx = -1;
+                        ClearForm();
+                    }
+                    else if (m_selectedEntryIdx > ei)
+                    {
+                        --m_selectedEntryIdx;
+                    }
+                }
+            }
+            SetFileDirty(fi, true);
+        }
+
+        const int n = fileEntryPairs.size();
+        RebuildTree();
+        RebuildGraph();
+        m_statusLabel->setText(
+            n == 1 ? QString("Deleted 1 node.") : QString("Deleted %1 nodes.").arg(n));
+    }
+
     void OghamStoryteller::OnDeleteNodeFromGraph(int fileIdx, int entryIdx)
     {
         if (fileIdx < 0 || fileIdx >= m_loadedFiles.size()) return;
@@ -2665,930 +4314,14 @@ namespace FoundationOgham
             ClearForm();
             return;
         }
-
-        m_formStack->setCurrentIndex(1);
         m_playFromNodeBtn->setEnabled(true);
-        const OghamSourceEntry& entry = m_loadedFiles[fileIdx].entries[entryIdx];
-
-        const QStringList oghamTags  = FetchKnownOghamTags();
-
-        m_tagCombo->blockSignals(true);
-        m_tagCombo->clear();
-        m_tagCombo->addItems(oghamTags);
-        if (auto* cpl = m_tagCombo->completer())
-            cpl->setModel(m_tagCombo->model());
-        m_tagCombo->setCurrentText(entry.tag);
-        m_tagCombo->blockSignals(false);
-        m_renamedFromTag = entry.tag;
-        ApplyTagStatus(m_tagStatus, entry.tag, oghamTags);
-
-        // Wire status button to add-to-gptags if yellow
-        disconnect(m_tagStatus, nullptr, nullptr, nullptr);
-        if (m_tagStatus->isEnabled())
-        {
-            connect(m_tagStatus, &QToolButton::clicked,
-                [this]()
-                {
-                    if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-                    const QString tag =
-                        m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx].tag;
-                    AddTagToGptagsFile(tag);
-                    ApplyTagStatus(m_tagStatus, tag, FetchKnownOghamTags());
-                    disconnect(m_tagStatus, nullptr, nullptr, nullptr);
-                });
-        }
-
-        RebuildTextKeysArea();
-        RebuildEntryOpsArea();
-        RebuildOptionsArea();
     }
 
     void OghamStoryteller::ClearForm()
     {
         m_selectedFileIdx  = -1;
         m_selectedEntryIdx = -1;
-        m_renamedFromTag.clear();
-        m_formStack->setCurrentIndex(0);
         m_playFromNodeBtn->setEnabled(false);
-
-        m_tagCombo->blockSignals(true);
-        m_tagCombo->clear();
-        m_tagCombo->blockSignals(false);
-
-        m_tagStatus->setText("\xe2\x97\x8f");
-        m_tagStatus->setStyleSheet("color: #555555;");
-        m_tagStatus->setEnabled(false);
-        disconnect(m_tagStatus, nullptr, nullptr, nullptr);
-
-        QLayoutItem* child;
-        while ((child = m_keysLayout->takeAt(0)))    { if (child->widget()) child->widget()->deleteLater(); delete child; }
-        while ((child = m_entOpsLayout->takeAt(0)))  { if (child->widget()) child->widget()->deleteLater(); delete child; }
-        while ((child = m_optsLayout->takeAt(0)))    { if (child->widget()) child->widget()->deleteLater(); delete child; }
-    }
-
-    // Shared helper: write a key/value to the default lexicon immediately.
-    static void WriteToDefaultLexicon(const QString& key, const QString& value,
-                                       const QStringList& lexFilePaths)
-    {
-        if (key.isEmpty() || lexFilePaths.isEmpty()) return;
-
-        QString defaultPath;
-        for (const QString& fp : lexFilePaths)
-            if (QFileInfo(fp).baseName().compare("default", Qt::CaseInsensitive) == 0)
-            { defaultPath = fp; break; }
-        if (defaultPath.isEmpty()) defaultPath = lexFilePaths.first();
-
-        QFile f(defaultPath);
-        if (!f.open(QIODevice::ReadOnly)) return;
-        QJsonParseError err;
-        auto doc = QJsonDocument::fromJson(f.readAll(), &err);
-        f.close();
-        if (err.error != QJsonParseError::NoError || !doc.isObject()) return;
-
-        QJsonObject root    = doc.object();
-        QJsonObject entries = root[QStringLiteral("entries")].toObject();
-        entries[key]        = value;
-        root[QStringLiteral("entries")] = entries;
-
-        if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return;
-        f.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
-    }
-
-    // Shared helper: build a text-key row widget
-    // [status][key combo, stretch][value edit (single-line collapsed / multiline)][▼][X or nullptr]
-    static QWidget* MakeTextKeyRow(
-        const QString&     currentKey,
-        const QString&     currentValue,
-        const QStringList& knownKeys,
-        QWidget*           parent,
-        std::function<void(const QString& key)>   onKeyChanged,
-        std::function<void(const QString& val)>   onValueChanged,
-        std::function<void()>                     onStatusClicked,
-        std::function<void()>                     onRemove)
-    {
-        auto* outer  = new QWidget(parent);
-        auto* outerV = new QVBoxLayout(outer);
-        outerV->setContentsMargins(0, 0, 0, 0);
-        outerV->setSpacing(2);
-
-        // ── Top row: [status][key combo][value (elided)][▼][X] ──────────────
-        auto* topRow = new QWidget(outer);
-        auto* hl     = new QHBoxLayout(topRow);
-        hl->setContentsMargins(0, 0, 0, 0);
-        hl->setSpacing(4);
-
-        auto* statusBtn = new QToolButton(topRow);
-        statusBtn->setFixedWidth(26);
-        statusBtn->setAutoRaise(true);
-
-        auto* keyCombo = new QComboBox(topRow);
-        keyCombo->setEditable(true);
-        keyCombo->setInsertPolicy(QComboBox::NoInsert);
-        keyCombo->addItems(knownKeys);
-        keyCombo->setCurrentText(currentKey);
-        keyCombo->setPlaceholderText("localisation key");
-        auto* cpl = new QCompleter(knownKeys, keyCombo);
-        cpl->setCaseSensitivity(Qt::CaseInsensitive);
-        cpl->setFilterMode(Qt::MatchContains);
-        keyCombo->setCompleter(cpl);
-
-        auto* toggleBtn = new QToolButton(topRow);
-        toggleBtn->setFixedWidth(22);
-        toggleBtn->setText("\xe2\x96\xbc"); // ▼
-
-        hl->addWidget(statusBtn);
-        hl->addWidget(keyCombo, 1);
-        hl->addWidget(toggleBtn);
-
-        if (onRemove)
-        {
-            auto* removeBtn = new QPushButton("X", topRow);
-            removeBtn->setFixedWidth(26);
-            removeBtn->setStyleSheet("color: #cc3333; font-weight: bold;");
-            hl->addWidget(removeBtn);
-            QObject::connect(removeBtn, &QPushButton::clicked, [onRemove]() { onRemove(); });
-        }
-        outerV->addWidget(topRow);
-
-        // ── Expanded row: full-width value edit (shown when ▼ is toggled) ────
-        auto* expandRow  = new QWidget(outer);
-        auto* expandHL   = new QHBoxLayout(expandRow);
-        expandHL->setContentsMargins(26 + 4, 0, 0, 0);
-        expandHL->setSpacing(0);
-        auto* fullEdit = new QLineEdit(currentValue, expandRow);
-        fullEdit->setPlaceholderText("value");
-        expandHL->addWidget(fullEdit, 1);
-        expandRow->setVisible(false);
-        outerV->addWidget(expandRow);
-
-        // ── Apply initial status ──────────────────────────────────────────────
-        auto applyStatus = [statusBtn, knownKeys, onStatusClicked](const QString& key)
-        {
-            statusBtn->disconnect();
-            const bool emp = key.isEmpty();
-            const bool hit = !emp && knownKeys.contains(key);
-            if (emp)
-            {
-                statusBtn->setText("\xe2\x97\x8f");
-                statusBtn->setStyleSheet("color: #555555;");
-                statusBtn->setToolTip("No key set.");
-                statusBtn->setEnabled(false);
-            }
-            else if (hit)
-            {
-                statusBtn->setText(QString(QChar(0x2713)));
-                statusBtn->setStyleSheet("color: #44aa44; font-weight: bold;");
-                statusBtn->setToolTip(QString("Key '%1' found in Lexicon.").arg(key));
-                statusBtn->setEnabled(false);
-            }
-            else
-            {
-                statusBtn->setText("\xe2\x9a\xa0");
-                statusBtn->setStyleSheet("color: #cc7700; font-weight: bold;");
-                statusBtn->setToolTip("Key not in any Lexicon. Click to add.");
-                statusBtn->setEnabled(true);
-                if (onStatusClicked)
-                    QObject::connect(statusBtn, &QToolButton::clicked,
-                                     [onStatusClicked]() { onStatusClicked(); });
-            }
-        };
-        applyStatus(currentKey);
-
-        // ── Wire toggle ───────────────────────────────────────────────────────
-        QObject::connect(toggleBtn, &QToolButton::clicked,
-            [expandRow, toggleBtn]()
-            {
-                const bool show = !expandRow->isVisible();
-                expandRow->setVisible(show);
-                toggleBtn->setText(show ? "\xe2\x96\xb2" : "\xe2\x96\xbc");
-            });
-
-        // ── Wire key combo ─────────────────────────────────────────────────────
-        // Every keystroke: update status indicator only (no save — prevents focus stealing)
-        QObject::connect(keyCombo, &QComboBox::editTextChanged,
-            [applyStatus](const QString& v) { applyStatus(v.trimmed()); });
-        // Commit (Enter / focus-loss / dropdown pick): update data model + save
-        QObject::connect(keyCombo->lineEdit(), &QLineEdit::editingFinished,
-            [keyCombo, onKeyChanged]()
-            {
-                if (onKeyChanged) onKeyChanged(keyCombo->currentText().trimmed());
-            });
-        QObject::connect(keyCombo, QOverload<int>::of(&QComboBox::activated),
-            [keyCombo, onKeyChanged](int)
-            {
-                if (onKeyChanged) onKeyChanged(keyCombo->currentText().trimmed());
-            });
-
-        // ── Wire value edit ────────────────────────────────────────────────────
-        QObject::connect(fullEdit, &QLineEdit::editingFinished,
-            [fullEdit, onValueChanged]()
-            {
-                if (onValueChanged) onValueChanged(fullEdit->text());
-            });
-
-        return outer;
-    }
-
-    void OghamStoryteller::RebuildTextKeysArea()
-    {
-        QLayoutItem* child;
-        while ((child = m_keysLayout->takeAt(0))) { if (child->widget()) child->widget()->deleteLater(); delete child; }
-
-        if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-
-        const QStringList knownKeys = FetchKnownLexiconKeys();
-
-        // Resolve lexicon file paths for live value writing
-        AZStd::vector<AZStd::string> azPaths;
-        FoundationLocalisation::LexiconEditorRequestBus::BroadcastResult(
-            azPaths, &FoundationLocalisation::LexiconEditorRequests::GetKnownFilePaths);
-        QStringList lexPaths;
-        auto* fileIO = AZ::IO::FileIOBase::GetInstance();
-        for (const auto& p : azPaths)
-        {
-            AZ::IO::FixedMaxPath resolved;
-            if (fileIO && fileIO->ResolvePath(resolved, p.c_str()))
-                lexPaths.append(QString::fromUtf8(resolved.c_str()));
-            else
-                lexPaths.append(QString::fromUtf8(p.c_str()));
-        }
-
-        const QStringList& keys =
-            m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx].dataKeys;
-
-        for (int i = 0; i < keys.size(); ++i)
-        {
-            const QString& currentKey = keys[i];
-            const QString  currentVal = FetchLexiconValueForKey(currentKey);
-            int ci = i;
-
-            auto onKeyChanged = [this, ci](const QString& key)
-            {
-                if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-                auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                if (ci < e.dataKeys.size()) e.dataKeys[ci] = key;
-                SetFileDirty(m_selectedFileIdx, true);
-            };
-
-            auto onValueChanged = [this, ci, lexPaths](const QString& val)
-            {
-                if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-                auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                if (ci >= e.dataKeys.size()) return;
-                const QString& key = e.dataKeys[ci];
-                if (key.isEmpty()) return;
-                WriteToDefaultLexicon(key, val, lexPaths);
-                FoundationLocalisation::LexiconEditorRequestBus::Broadcast(
-                    &FoundationLocalisation::LexiconEditorRequests::RefreshKeyTree);
-            };
-
-            auto onStatusClicked = [this, ci]()
-            {
-                if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-                auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                if (ci >= e.dataKeys.size()) return;
-                const QString& typed = e.dataKeys[ci];
-                const QString sugKey = IsValidTagStructure(typed) ? typed : QString{};
-                const QString sugVal = IsValidTagStructure(typed)
-                    ? QString("[%1-TextKey%2]").arg(e.tag).arg(ci) : typed;
-                ShowAddKeyDialog(sugKey, sugVal);
-            };
-
-            auto onRemove = [this, ci]()
-            {
-                if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-                auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                if (ci < e.dataKeys.size())
-                {
-                    e.dataKeys.removeAt(ci);
-                    SetFileDirty(m_selectedFileIdx, true);
-                    RebuildTextKeysArea();
-                }
-            };
-
-            m_keysLayout->addWidget(
-                MakeTextKeyRow(currentKey, currentVal, knownKeys, m_keysWidget,
-                               onKeyChanged, onValueChanged, onStatusClicked, onRemove));
-        }
-    }
-
-    void OghamStoryteller::RebuildOptionsArea()
-    {
-        QLayoutItem* child;
-        while ((child = m_optsLayout->takeAt(0))) { if (child->widget()) child->widget()->deleteLater(); delete child; }
-
-        if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-        const QStringList knownKeys  = FetchKnownLexiconKeys();
-        const QStringList oghamTags  = FetchKnownOghamTags();
-
-        // Resolve lexicon file paths for live value writing
-        AZStd::vector<AZStd::string> azOptPaths;
-        FoundationLocalisation::LexiconEditorRequestBus::BroadcastResult(
-            azOptPaths, &FoundationLocalisation::LexiconEditorRequests::GetKnownFilePaths);
-        QStringList optLexPaths;
-        auto* optFileIO = AZ::IO::FileIOBase::GetInstance();
-        for (const auto& p : azOptPaths)
-        {
-            AZ::IO::FixedMaxPath resolved;
-            if (optFileIO && optFileIO->ResolvePath(resolved, p.c_str()))
-                optLexPaths.append(QString::fromUtf8(resolved.c_str()));
-            else
-                optLexPaths.append(QString::fromUtf8(p.c_str()));
-        }
-        // allTags: option tag combo completer (entry tags + OghamStoryteller tags)
-        QStringList allTags = oghamTags;
-        for (const QString& t : FetchAllEntryTags())
-            if (!allTags.contains(t)) allTags.append(t);
-        allTags.sort(Qt::CaseInsensitive);
-        // condOpTags: cond/op tag validation — any tag in any .gptags file is valid
-        const QStringList condOpTags = FetchAllTagsFromAllFiles();
-
-        const QString currentEntryTag =
-            m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx].tag;
-        const auto& opts = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx].options;
-
-        for (int i = 0; i < opts.size(); ++i)
-        {
-            const OghamSourceOption& opt = opts[i];
-
-            auto* frame = new QFrame(m_optsWidget);
-            frame->setFrameShape(QFrame::StyledPanel);
-            frame->setFrameShadow(QFrame::Raised);
-            auto* fl = new QFormLayout(frame);
-            fl->setContentsMargins(6, 6, 6, 6); fl->setSpacing(4);
-
-            // ── Option tag row: tristate status + combo + X ───────────────────
-            auto* tagRow    = new QHBoxLayout();
-            auto* optTagSt  = new QToolButton(frame);
-            optTagSt->setFixedWidth(26);
-            optTagSt->setAutoRaise(true);
-            ApplyTagStatus(optTagSt, opt.tag, oghamTags);
-            // D: wire ⚠ click to add tag to gptags file
-            if (optTagSt->isEnabled())
-            {
-                const QString capturedTag = opt.tag;
-                connect(optTagSt, &QToolButton::clicked,
-                    [this, optTagSt, capturedTag]()
-                    {
-                        AddTagToGptagsFile(capturedTag);
-                        ApplyTagStatus(optTagSt, capturedTag, FetchKnownOghamTags());
-                        optTagSt->disconnect();
-                    });
-            }
-            tagRow->addWidget(optTagSt);
-
-            auto* optTagCombo = new QComboBox(frame);
-            optTagCombo->setEditable(true);
-            optTagCombo->setInsertPolicy(QComboBox::NoInsert);
-            optTagCombo->addItems(allTags);
-            optTagCombo->setCurrentText(opt.tag);
-            optTagCombo->setPlaceholderText("Option tag");
-            auto* otCpl = new QCompleter(allTags, optTagCombo);
-            otCpl->setCaseSensitivity(Qt::CaseInsensitive);
-            otCpl->setFilterMode(Qt::MatchContains);
-            optTagCombo->setCompleter(otCpl);
-            tagRow->addWidget(optTagCombo, 1);
-
-            auto* removeBtn = new QPushButton("X", frame);
-            removeBtn->setFixedWidth(26);
-            removeBtn->setStyleSheet("color: #cc3333; font-weight: bold;");
-            tagRow->addWidget(removeBtn);
-            fl->addRow("Tag:", tagRow);
-
-            {
-                const int    oci      = i;
-                const QString initKey = opt.textKey;
-                const QString initVal = FetchLexiconValueForKey(initKey);
-
-                auto tkOnKey = [this, oci](const QString& key)
-                {
-                    if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-                    auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                    if (oci < e.options.size()) { e.options[oci].textKey = key; SetFileDirty(m_selectedFileIdx, true); }
-                };
-                auto tkOnVal = [this, oci, optLexPaths](const QString& val)
-                {
-                    if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-                    auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                    if (oci >= e.options.size()) return;
-                    const QString& key = e.options[oci].textKey;
-                    if (key.isEmpty()) return;
-                    WriteToDefaultLexicon(key, val, optLexPaths);
-                    FoundationLocalisation::LexiconEditorRequestBus::Broadcast(
-                        &FoundationLocalisation::LexiconEditorRequests::RefreshKeyTree);
-                };
-                auto tkOnStatus = [this, oci]()
-                {
-                    if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-                    auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                    if (oci >= e.options.size()) return;
-                    const QString& typed = e.options[oci].textKey;
-                    const QString sugKey = IsValidTagStructure(typed) ? typed : QString{};
-                    const QString sugVal = IsValidTagStructure(typed)
-                        ? QString("[%1-Option%2]").arg(e.tag).arg(oci) : typed;
-                    ShowAddKeyDialog(sugKey, sugVal);
-                };
-                fl->addRow("Text Key:",
-                    MakeTextKeyRow(initKey, initVal, knownKeys, frame,
-                                   tkOnKey, tkOnVal, tkOnStatus, nullptr));
-            }
-
-            // ── Target entry row: tristate status + combo ─────────────────────
-            // M: build target list excluding the current entry (circular reference prevention)
-            QStringList targetEntries;
-            for (const QString& t : FetchAllEntryTags())
-                if (t != currentEntryTag) targetEntries.append(t);
-
-            auto* targetRow = new QHBoxLayout();
-            auto* targetSt  = new QToolButton(frame);
-            targetSt->setFixedWidth(26);
-            targetSt->setAutoRaise(true);
-            // M: flag circular reference
-            if (!opt.targetTag.isEmpty() && opt.targetTag == currentEntryTag)
-            {
-                targetSt->setText(QString(QChar(0x2717)));   // ✗
-                targetSt->setStyleSheet("color: #cc3333; font-weight: bold;");
-                targetSt->setToolTip("Cannot target own entry (circular reference).");
-                targetSt->setEnabled(false);
-            }
-            else
-            {
-                ApplyTagStatus(targetSt, opt.targetTag, targetEntries, /*allowEmpty=*/true);
-            }
-            targetRow->addWidget(targetSt);
-
-            auto* targetCombo = new QComboBox(frame);
-            targetCombo->setEditable(true);
-            targetCombo->setInsertPolicy(QComboBox::NoInsert);
-            targetCombo->addItems(targetEntries);
-            targetCombo->setCurrentText(opt.targetTag);
-            targetCombo->setPlaceholderText("target entry tag  (empty = end conversation)");
-            auto* teCpl = new QCompleter(targetEntries, targetCombo);
-            teCpl->setCaseSensitivity(Qt::CaseInsensitive);
-            teCpl->setFilterMode(Qt::MatchContains);
-            targetCombo->setCompleter(teCpl);
-            targetRow->addWidget(targetCombo, 1);
-            fl->addRow("Target Entry:", targetRow);
-
-            // ── Per-option Conditions ─────────────────────────────────────────
-            static const char* kOptCondTooltip =
-                "Gameplay Tag conditions tested against the Dialogue State to determine "
-                "whether this option should be displayed. If any condition fails this "
-                "option is omitted from the Entry Signal entirely.";
-            auto* addOptCond = new QPushButton("+", frame);
-            addOptCond->setFixedSize(22, 22);
-            addOptCond->setToolTip(kOptCondTooltip);
-            {
-                auto* optCondHdr = new QHBoxLayout();
-                auto* optCondLabel = new QLabel("  Conditions:", frame);
-                optCondLabel->setToolTip(kOptCondTooltip);
-                optCondHdr->addWidget(optCondLabel);
-                optCondHdr->addStretch();
-                optCondHdr->addWidget(addOptCond);
-                fl->addRow("", optCondHdr);
-            }
-            auto* optCondContainer = new QWidget(frame);
-            auto* optCondVL        = new QVBoxLayout(optCondContainer);
-            optCondVL->setContentsMargins(12, 0, 0, 0);
-            optCondVL->setSpacing(2);
-            fl->addRow("", optCondContainer);
-
-            // ── Per-option Operations ─────────────────────────────────────────
-            static const char* kOptOpsTooltip =
-                "Gameplay Tag operations executed on the Dialogue State when this option "
-                "is selected. Each operation can optionally have a condition that must be "
-                "true for it to be applied.";
-            auto* addOptOp = new QPushButton("+", frame);
-            addOptOp->setFixedSize(22, 22);
-            addOptOp->setToolTip(kOptOpsTooltip);
-            {
-                auto* optOpsHdr = new QHBoxLayout();
-                auto* optOpsLabel = new QLabel("  Operations:", frame);
-                optOpsLabel->setToolTip(kOptOpsTooltip);
-                optOpsHdr->addWidget(optOpsLabel);
-                optOpsHdr->addStretch();
-                optOpsHdr->addWidget(addOptOp);
-                fl->addRow("", optOpsHdr);
-            }
-            auto* optOpsContainer = new QWidget(frame);
-            auto* optOpsVL        = new QVBoxLayout(optOpsContainer);
-            optOpsVL->setContentsMargins(12, 0, 0, 0);
-            optOpsVL->setSpacing(2);
-            fl->addRow("", optOpsContainer);
-
-            m_optsLayout->addWidget(frame);
-            int ci = i;
-
-            // Populate conditions rows for this option.
-            // MakeConditionRow only calls onChanged() on [X] (not on text edits), so
-            // a full RebuildOptionsArea() here is safe — no focus stealing from typing.
-            {
-                auto onCondRemoved = [this]() { RebuildOptionsArea(); };
-
-                const auto& conds = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx].options[i].conditions;
-                const int total = conds.size();
-                for (int k = 0; k < total; ++k)
-                {
-                    auto getCondList = [this, i]() -> CondList&
-                    { return m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx].options[i].conditions; };
-                    optCondVL->addWidget(MakeConditionRow(k, getCondList, onCondRemoved,
-                        condOpTags, /*isLast=*/ k == total - 1));
-                }
-            }
-
-            // Populate operations rows for this option (B: use allTags)
-            {
-                const auto& ops = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx].options[i].operations;
-                for (int k = 0; k < ops.size(); ++k)
-                {
-                    auto getOpList = [this, i]() -> OpList&
-                    { return m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx].options[i].operations; };
-                    auto onOpChanged = [this]()
-                    { SetFileDirty(m_selectedFileIdx, true); RebuildOptionsArea(); };
-                    optOpsVL->addWidget(MakeOperationRow(k, getOpList, onOpChanged, condOpTags));
-                }
-            }
-
-            // Wire add-condition button
-            connect(addOptCond, &QPushButton::clicked,
-                [this, i]()
-                {
-                    if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-                    auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                    if (i < e.options.size())
-                    {
-                        e.options[i].conditions.append(OghamCondition{});
-                        RebuildOptionsArea();
-                    }
-                });
-
-            // Wire add-operation button
-            connect(addOptOp, &QPushButton::clicked,
-                [this, i]()
-                {
-                    if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-                    auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                    if (i < e.options.size())
-                    {
-                        e.options[i].operations.append(OghamOperation{});
-                        SetFileDirty(m_selectedFileIdx, true);
-                        RebuildOptionsArea();
-                    }
-                });
-
-            connect(optTagCombo, &QComboBox::editTextChanged,
-                [this, optTagSt, oghamTags, ci](const QString& v)
-                {
-                    if (m_selectedFileIdx >= 0 && m_selectedEntryIdx >= 0) {
-                        auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                        if (ci < e.options.size()) { e.options[ci].tag = v; SetFileDirty(m_selectedFileIdx, true); } }
-                    // Option tags validate against gptags only (not entry tags)
-                    ApplyTagStatus(optTagSt, v, oghamTags);
-                    // Rewire click for new value
-                    optTagSt->disconnect();
-                    if (optTagSt->isEnabled())
-                    {
-                        connect(optTagSt, &QToolButton::clicked,
-                            [this, optTagSt, v]()
-                            {
-                                AddTagToGptagsFile(v);
-                                ApplyTagStatus(optTagSt, v, FetchKnownOghamTags());
-                                optTagSt->disconnect();
-                            });
-                    }
-                });
-
-            connect(targetCombo, &QComboBox::editTextChanged,
-                [this, targetSt, targetEntries, currentEntryTag, ci](const QString& v)
-                {
-                    if (m_selectedFileIdx >= 0 && m_selectedEntryIdx >= 0) {
-                        auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                        if (ci < e.options.size()) { e.options[ci].targetTag = v; SetFileDirty(m_selectedFileIdx, true); } }
-                    // M: detect circular reference
-                    if (!v.isEmpty() && v == currentEntryTag)
-                    {
-                        targetSt->setText(QString(QChar(0x2717)));
-                        targetSt->setStyleSheet("color: #cc3333; font-weight: bold;");
-                        targetSt->setToolTip("Cannot target own entry (circular reference).");
-                        targetSt->setEnabled(false);
-                    }
-                    else
-                    {
-                        ApplyTagStatus(targetSt, v, targetEntries, /*allowEmpty=*/true);
-                    }
-                });
-
-            connect(removeBtn, &QPushButton::clicked,
-                [this, ci]()
-                { if (m_selectedFileIdx >= 0 && m_selectedEntryIdx >= 0) {
-                    auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-                    if (ci < e.options.size()) { e.options.removeAt(ci); SetFileDirty(m_selectedFileIdx, true); RebuildOptionsArea(); } } });
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // Condition / Operation row builders
-    // -------------------------------------------------------------------------
-
-    static const QStringList kComparisons = {
-        "Exists", "NotExists", "Equal", "NotEqual", "Less", "LessEqual", "Greater", "GreaterEqual"
-    };
-    static const QStringList kArithmetics = {
-        "Set", "Add", "Sub", "Mul", "Div", "Min", "Max"
-    };
-    static const QStringList kLogicOps = { "And", "Or", "Xor" };
-    static bool kNumericComparison(const QString& cmp)
-    {
-        return cmp == "Equal"   || cmp == "NotEqual" ||
-               cmp == "Less"    || cmp == "LessEqual" ||
-               cmp == "Greater" || cmp == "GreaterEqual";
-    }
-
-    QWidget* OghamStoryteller::MakeConditionRow(
-        int ci,
-        std::function<CondList&()> getList,
-        std::function<void()>      onChanged,
-        const QStringList&         knownTags,
-        bool                       isLast)
-    {
-        auto* row = new QWidget();
-        auto* hl  = new QHBoxLayout(row);
-        hl->setContentsMargins(0, 0, 0, 0);
-        hl->setSpacing(4);
-
-        // Tag status icon (left of combo)
-        auto* tagStatus = new QToolButton(row);
-        tagStatus->setFixedWidth(26);
-        tagStatus->setAutoRaise(true);
-
-        // Tag combo
-        auto* tagCombo = new QComboBox(row);
-        tagCombo->setEditable(true);
-        tagCombo->setInsertPolicy(QComboBox::NoInsert);
-        tagCombo->addItems(knownTags);
-        CondList& clist = getList();
-        const QString initCondTag = ci < clist.size() ? clist[ci].tag : QString{};
-        tagCombo->setCurrentText(initCondTag);
-        tagCombo->setPlaceholderText("tag");
-        auto* cpl = new QCompleter(knownTags, tagCombo);
-        cpl->setCaseSensitivity(Qt::CaseInsensitive);
-        cpl->setFilterMode(Qt::MatchContains);
-        tagCombo->setCompleter(cpl);
-        ApplyTagStatus(tagStatus, initCondTag, knownTags);
-        if (tagStatus->isEnabled())
-            connect(tagStatus, &QToolButton::clicked,
-                [this, tagStatus, initCondTag]() { ShowAddTagDialog(initCondTag, tagStatus); });
-        hl->addWidget(tagStatus);
-        hl->addWidget(tagCombo, 2);
-
-        // Comparison dropdown
-        auto* cmpCombo = new QComboBox(row);
-        cmpCombo->addItems(kComparisons);
-        cmpCombo->setCurrentText(ci < clist.size() ? clist[ci].comparison : kComparisons[0]);
-        hl->addWidget(cmpCombo, 1);
-
-        // Unsigned whole-number value — hidden unless comparison is numeric
-        auto* valSpin = new QSpinBox(row);
-        valSpin->setRange(0, INT_MAX);
-        valSpin->setValue(ci < clist.size() ? clist[ci].value : 0);
-        valSpin->setVisible(kNumericComparison(cmpCombo->currentText()));
-        hl->addWidget(valSpin, 1);
-
-        // Logic-op dropdown — hidden on the last row (E)
-        auto* logicCombo = new QComboBox(row);
-        logicCombo->addItems(kLogicOps);
-        logicCombo->setCurrentText(ci < clist.size() ? clist[ci].logicOp : kLogicOps[0]);
-        logicCombo->setToolTip("Logic operator connecting this condition to the next");
-        logicCombo->setVisible(!isLast);
-        hl->addWidget(logicCombo, 1);
-
-        // X button
-        auto* removeBtn = new QPushButton("X", row);
-        removeBtn->setFixedWidth(26);
-        removeBtn->setStyleSheet("color: #cc3333; font-weight: bold;");
-        hl->addWidget(removeBtn);
-
-        // ── Connections ──────────────────────────────────────────────────────
-        // Data-only changes write to model and mark dirty WITHOUT triggering a
-        // rebuild (which would steal focus on every keystroke).
-        // Only the remove button triggers a structural rebuild via onChanged().
-        connect(tagCombo, &QComboBox::editTextChanged,
-            [this, getList, ci, tagStatus, knownTags](const QString& v)
-            {
-                CondList& cl = getList();
-                if (ci < cl.size()) { cl[ci].tag = v; SetFileDirty(m_selectedFileIdx, true); }
-                ApplyTagStatus(tagStatus, v.trimmed(), knownTags);
-                tagStatus->disconnect();
-                if (tagStatus->isEnabled())
-                    connect(tagStatus, &QToolButton::clicked,
-                        [this, tagStatus, v]() { ShowAddTagDialog(v.trimmed(), tagStatus); });
-            });
-
-        connect(cmpCombo, &QComboBox::currentTextChanged,
-            [this, getList, valSpin, ci](const QString& v)
-            {
-                CondList& cl = getList();
-                if (ci < cl.size()) { cl[ci].comparison = v; SetFileDirty(m_selectedFileIdx, true); }
-                valSpin->setVisible(kNumericComparison(v));
-            });
-
-        connect(valSpin, QOverload<int>::of(&QSpinBox::valueChanged),
-            [this, getList, ci](int v)
-            {
-                CondList& cl = getList();
-                if (ci < cl.size()) { cl[ci].value = v; SetFileDirty(m_selectedFileIdx, true); }
-            });
-
-        connect(logicCombo, &QComboBox::currentTextChanged,
-            [this, getList, ci](const QString& v)
-            {
-                CondList& cl = getList();
-                if (ci < cl.size()) { cl[ci].logicOp = v; SetFileDirty(m_selectedFileIdx, true); }
-            });
-
-        connect(removeBtn, &QPushButton::clicked,
-            [getList, onChanged, ci]()
-            {
-                CondList& cl = getList();
-                if (ci < cl.size()) { cl.removeAt(ci); onChanged(); }
-            });
-
-        return row;
-    }
-
-    QWidget* OghamStoryteller::MakeOperationRow(
-        int oi,
-        std::function<OpList&()>  getList,
-        std::function<void()>     onChanged,
-        const QStringList&        knownTags)
-    {
-        auto* frame = new QFrame();
-        frame->setFrameShape(QFrame::StyledPanel);
-        auto* fl = new QVBoxLayout(frame);
-        fl->setContentsMargins(6, 4, 6, 4);
-        fl->setSpacing(4);
-
-        OpList& oplist = getList();
-        const OghamOperation& op = oi < oplist.size() ? oplist[oi] : OghamOperation{};
-
-        // ── Top row: tag + arithmetic + value + X ────────────────────────────
-        auto* topRow = new QWidget(frame);
-        auto* hl     = new QHBoxLayout(topRow);
-        hl->setContentsMargins(0, 0, 0, 0);
-        hl->setSpacing(4);
-
-        auto* opTagStatus = new QToolButton(topRow);
-        opTagStatus->setFixedWidth(26);
-        opTagStatus->setAutoRaise(true);
-
-        auto* tagCombo = new QComboBox(topRow);
-        tagCombo->setEditable(true);
-        tagCombo->setInsertPolicy(QComboBox::NoInsert);
-        tagCombo->addItems(knownTags);
-        tagCombo->setCurrentText(op.tag);
-        tagCombo->setPlaceholderText("tag");
-        auto* cpl = new QCompleter(knownTags, tagCombo);
-        cpl->setCaseSensitivity(Qt::CaseInsensitive);
-        cpl->setFilterMode(Qt::MatchContains);
-        tagCombo->setCompleter(cpl);
-        ApplyTagStatus(opTagStatus, op.tag, knownTags);
-        if (opTagStatus->isEnabled())
-            connect(opTagStatus, &QToolButton::clicked,
-                [this, opTagStatus, capturedTag = op.tag]()
-                { ShowAddTagDialog(capturedTag, opTagStatus); });
-        hl->addWidget(opTagStatus);
-        hl->addWidget(tagCombo, 2);
-
-        auto* arithCombo = new QComboBox(topRow);
-        arithCombo->addItems(kArithmetics);
-        arithCombo->setCurrentText(op.arithmetic);
-        hl->addWidget(arithCombo, 1);
-
-        auto* valSpin = new QSpinBox(topRow);
-        valSpin->setRange(0, INT_MAX);
-        valSpin->setValue(op.value);
-        hl->addWidget(valSpin, 1);
-
-        auto* removeBtn = new QPushButton("X", topRow);
-        removeBtn->setFixedWidth(26);
-        removeBtn->setStyleSheet("color: #cc3333; font-weight: bold;");
-        hl->addWidget(removeBtn);
-
-        fl->addWidget(topRow);
-
-        // ── Nested conditions section ─────────────────────────────────────────
-        static const char* kOpCondTooltip =
-            "Conditions that must be true for this operation to be applied. "
-            "Leave empty to always apply the operation.";
-        auto* condHeader = new QHBoxLayout();
-        auto* opCondLabel = new QLabel("  Conditions:", frame);
-        opCondLabel->setToolTip(kOpCondTooltip);
-        condHeader->addWidget(opCondLabel);
-        condHeader->addStretch();
-        auto* addCondBtn = new QPushButton("+", frame);
-        addCondBtn->setFixedSize(22, 22);
-        addCondBtn->setToolTip(kOpCondTooltip);
-        condHeader->addWidget(addCondBtn);
-        fl->addLayout(condHeader);
-
-        auto* condContainer = new QWidget(frame);
-        auto* condVL        = new QVBoxLayout(condContainer);
-        condVL->setContentsMargins(12, 0, 0, 0);
-        condVL->setSpacing(2);
-
-        // Populate existing op conditions.
-        // MakeConditionRow only calls onChanged() on [X] (not on text edits), so
-        // a full area rebuild here is safe — no focus stealing from typing.
-        {
-            OpList& ol = getList();
-            if (oi < ol.size())
-            {
-                const int total = ol[oi].conditions.size();
-                for (int k = 0; k < total; ++k)
-                {
-                    auto gcl = [getList, oi]() -> CondList& { return getList()[oi].conditions; };
-                    condVL->addWidget(MakeConditionRow(k, gcl, onChanged,
-                        knownTags, /*isLast=*/ k == total - 1));
-                }
-            }
-        }
-        fl->addWidget(condContainer);
-
-        // ── Connections for op row ────────────────────────────────────────────
-        // Data-only changes (tag/arith/value) write to the model and mark dirty
-        // WITHOUT triggering a full area rebuild — that would steal focus on every
-        // keystroke. Only structural changes (remove) call onChanged().
-        connect(tagCombo, &QComboBox::editTextChanged,
-            [this, getList, oi, opTagStatus, knownTags](const QString& v)
-            {
-                OpList& ol = getList();
-                if (oi < ol.size()) { ol[oi].tag = v; SetFileDirty(m_selectedFileIdx, true); }
-                ApplyTagStatus(opTagStatus, v.trimmed(), knownTags);
-                opTagStatus->disconnect();
-                if (opTagStatus->isEnabled())
-                    connect(opTagStatus, &QToolButton::clicked,
-                        [this, opTagStatus, v]() { ShowAddTagDialog(v.trimmed(), opTagStatus); });
-            });
-
-        connect(arithCombo, &QComboBox::currentTextChanged,
-            [this, getList, oi](const QString& v)
-            { OpList& ol = getList(); if (oi < ol.size()) { ol[oi].arithmetic = v; SetFileDirty(m_selectedFileIdx, true); } });
-
-        connect(valSpin, QOverload<int>::of(&QSpinBox::valueChanged),
-            [this, getList, oi](int v)
-            { OpList& ol = getList(); if (oi < ol.size()) { ol[oi].value = v; SetFileDirty(m_selectedFileIdx, true); } });
-
-        connect(removeBtn, &QPushButton::clicked,
-            [getList, onChanged, oi]()
-            { OpList& ol = getList(); if (oi < ol.size()) { ol.removeAt(oi); onChanged(); } });
-
-        connect(addCondBtn, &QPushButton::clicked,
-            [getList, onChanged, oi]()
-            {
-                OpList& ol = getList();
-                if (oi < ol.size())
-                {
-                    ol[oi].conditions.append(OghamCondition{});
-                    onChanged();
-                }
-            });
-
-        return frame;
-    }
-
-    void OghamStoryteller::RebuildEntryOpsArea()
-    {
-        QLayoutItem* child;
-        while ((child = m_entOpsLayout->takeAt(0)))
-        { if (child->widget()) child->widget()->deleteLater(); delete child; }
-
-        if (m_selectedFileIdx < 0 || m_selectedEntryIdx < 0) return;
-
-        // Conditions/ops tag validation: any tag in any .gptags file is valid
-        const QStringList allTags = FetchAllTagsFromAllFiles();
-
-        auto& e = m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx];
-
-        for (int oi = 0; oi < e.entryOperations.size(); ++oi)
-        {
-            auto getList = [this]() -> OpList&
-            { return m_loadedFiles[m_selectedFileIdx].entries[m_selectedEntryIdx].entryOperations; };
-            auto onChanged = [this]()
-            { SetFileDirty(m_selectedFileIdx, true); RebuildEntryOpsArea(); };
-            m_entOpsLayout->addWidget(MakeOperationRow(oi, getList, onChanged, allTags));
-        }
-    }
-
-    void OghamStoryteller::TrySave()
-    {
-        if (m_isInteracting) return;
-        m_suppressWatcher = true;
-        for (int i = 0; i < m_loadedFiles.size(); ++i)
-        {
-            if (m_loadedFiles[i].dirty && SaveFile(i))
-                SetFileDirty(i, false);
-        }
-        m_suppressWatcher = false;
     }
 
     void OghamStoryteller::SetFileDirty(int fileIdx, bool dirty)
@@ -3617,9 +4350,6 @@ namespace FoundationOgham
             }
         }
 
-        if (dirty)
-            TrySave();
-
         UpdateStatusBar();
     }
 
@@ -3634,6 +4364,9 @@ namespace FoundationOgham
         }
 
         m_saveAllBtn->setEnabled(dirtyFiles > 0);
+        m_saveAllBtn->setStyleSheet(dirtyFiles > 0
+            ? "background-color: #4a7c2f; color: white; font-weight: bold;"
+            : "");
 
         if (m_loadedFiles.isEmpty())
             m_statusLabel->setText("No files loaded.");
@@ -3645,6 +4378,312 @@ namespace FoundationOgham
             m_statusLabel->setText(
                 QString("%1 entries across %2 file(s)  \u2014  All saved.")
                     .arg(totalEntries).arg(m_loadedFiles.size()));
+    }
+
+    // -------------------------------------------------------------------------
+    // Label management
+    // -------------------------------------------------------------------------
+
+    void OghamStoryteller::LoadGraphMeta()
+    {
+        m_graphLabels.clear();
+        if (m_graphMetaPath.isEmpty()) return;
+
+        QFile f(m_graphMetaPath);
+        if (!f.open(QIODevice::ReadOnly)) return;
+
+        QJsonParseError err;
+        const QJsonDocument doc = QJsonDocument::fromJson(f.readAll(), &err);
+        f.close();
+        if (err.error != QJsonParseError::NoError || !doc.isObject()) return;
+
+        const QJsonArray labelsArr = doc.object()["labels"].toArray();
+        for (const QJsonValue& v : labelsArr)
+        {
+            const QJsonObject o = v.toObject();
+            OghamLabel lbl;
+            lbl.id    = o["id"].toInt();
+            lbl.name  = o["name"].toString();
+            lbl.color = QColor(o["color"].toString());
+            m_graphLabels.append(lbl);
+        }
+    }
+
+    void OghamStoryteller::SaveGraphMeta()
+    {
+        if (m_graphMetaPath.isEmpty()) return;
+
+        QJsonArray labelsArr;
+        for (const OghamLabel& lbl : m_graphLabels)
+        {
+            QJsonObject o;
+            o["id"]    = lbl.id;
+            o["name"]  = lbl.name;
+            o["color"] = lbl.color.name();
+            labelsArr.append(o);
+        }
+
+        QJsonObject root;
+        root["labels"] = labelsArr;
+
+        QFile f(m_graphMetaPath);
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) return;
+        f.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+    }
+
+    void OghamStoryteller::ShowLabelModal(int fi, int ei, QPoint screenPos)
+    {
+        if (fi < 0 || fi >= m_loadedFiles.size()) return;
+        auto& entries = m_loadedFiles[fi].entries;
+        if (ei < 0 || ei >= entries.size()) return;
+        OghamSourceEntry& entry = entries[ei];
+
+        auto* dlg = new QDialog(this);
+        dlg->setWindowTitle("Labels");
+        dlg->setMinimumWidth(300);
+        auto* vl = new QVBoxLayout(dlg);
+
+        // Existing labels as checkboxes
+        QMap<int, QCheckBox*> cbMap;
+        for (const OghamLabel& lbl : m_graphLabels)
+        {
+            auto* cb = new QCheckBox(lbl.name, dlg);
+            cb->setChecked(entry.labelIds.contains(lbl.id));
+            // Color swatch in checkbox via stylesheet
+            const QString bg = lbl.color.name();
+            cb->setStyleSheet(QString("QCheckBox { color: %1; font-weight: bold; }").arg(bg));
+            cbMap[lbl.id] = cb;
+            vl->addWidget(cb);
+        }
+
+        vl->addSpacing(6);
+
+        // New label row
+        auto* newRow = new QWidget(dlg);
+        auto* newHL  = new QHBoxLayout(newRow);
+        newHL->setContentsMargins(0, 0, 0, 0);
+        auto* newName  = new QLineEdit(newRow);
+        newName->setPlaceholderText("New label name...");
+        auto* newColor = new QPushButton(newRow);
+        newColor->setFixedSize(24, 24);
+        QColor pickedColor(0x4a, 0x90, 0xd9);
+        auto updateColorBtn = [&pickedColor, newColor]()
+        {
+            newColor->setStyleSheet(
+                QString("background-color:%1; border:1px solid #888;").arg(pickedColor.name()));
+        };
+        updateColorBtn();
+        connect(newColor, &QPushButton::clicked, dlg,
+            [dlg, &pickedColor, updateColorBtn]()
+            {
+                QColor c = QColorDialog::getColor(pickedColor, dlg, "Label Color");
+                if (c.isValid()) { pickedColor = c; updateColorBtn(); }
+            });
+        newHL->addWidget(newName);
+        newHL->addWidget(newColor);
+        vl->addWidget(newRow);
+
+        auto* btnBox = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, dlg);
+        vl->addWidget(btnBox);
+
+        connect(btnBox, &QDialogButtonBox::accepted, dlg, &QDialog::accept);
+        connect(btnBox, &QDialogButtonBox::rejected, dlg, &QDialog::reject);
+
+        dlg->adjustSize();
+        const QRect screen = QApplication::primaryScreen()
+            ? QApplication::primaryScreen()->availableGeometry()
+            : QRect(0, 0, 1920, 1080);
+        QPoint pos = screenPos - QPoint(dlg->width() / 2, 0);
+        pos.setX(qBound(screen.left(), pos.x(), screen.right()  - dlg->width()));
+        pos.setY(qBound(screen.top(),  pos.y(), screen.bottom() - dlg->height()));
+        dlg->move(pos);
+
+        if (dlg->exec() != QDialog::Accepted) { delete dlg; return; }
+
+        // Create new label if name is non-empty
+        int newLabelId = -1;
+        const QString newLabelName = newName->text().trimmed();
+        if (!newLabelName.isEmpty())
+        {
+            int maxId = 0;
+            for (const OghamLabel& l : m_graphLabels) maxId = qMax(maxId, l.id);
+            OghamLabel newLbl;
+            newLbl.id    = maxId + 1;
+            newLbl.name  = newLabelName;
+            newLbl.color = pickedColor;
+            newLabelId = newLbl.id;
+            m_graphLabels.append(newLbl);
+            SaveGraphMeta();
+        }
+
+        // Apply checkbox state for existing labels + always-on newly created one
+        entry.labelIds.clear();
+        for (auto it = cbMap.cbegin(); it != cbMap.cend(); ++it)
+        {
+            if (it.value()->isChecked())
+                entry.labelIds.append(it.key());
+        }
+        if (newLabelId >= 0)
+            entry.labelIds.append(newLabelId);
+
+        delete dlg;
+        SetFileDirty(fi, true);
+        RebuildGraph();
+    }
+
+    void OghamStoryteller::ShowHighlightColorPicker(int fi, int ei)
+    {
+        if (fi < 0 || fi >= m_loadedFiles.size()) return;
+        auto& entries = m_loadedFiles[fi].entries;
+        if (ei < 0 || ei >= entries.size()) return;
+
+        const QColor current = entries[ei].highlightColor;
+        const QColor chosen  = QColorDialog::getColor(
+            current.isValid() ? current : Qt::white, this, "Node Highlight Color");
+        if (!chosen.isValid()) return;
+
+        entries[ei].highlightColor = chosen;
+        SetFileDirty(fi, true);
+        RebuildGraph();
+    }
+
+    // -------------------------------------------------------------------------
+    // Snap to grid
+    // -------------------------------------------------------------------------
+
+    void OghamStoryteller::OnSnapToggle()
+    {
+        m_snapToGrid = m_snapBtn->isChecked();
+        for (QGraphicsItem* gi : m_graphView->graphScene()->items())
+            if (auto* ni = dynamic_cast<OghamNodeItem*>(gi))
+                ni->setSnapToGrid(m_snapToGrid);
+    }
+
+    // -------------------------------------------------------------------------
+    // Node alignment
+    // -------------------------------------------------------------------------
+
+    void OghamStoryteller::AlignSelected(int mode)
+    {
+        QList<OghamNodeItem*> nodes;
+        for (QGraphicsItem* gi : m_graphView->graphScene()->selectedItems())
+            if (auto* ni = dynamic_cast<OghamNodeItem*>(gi))
+                nodes.append(ni);
+        if (nodes.size() < 2) return;
+
+        switch (mode)
+        {
+        case 0: // Align Left
+        {
+            qreal ref = nodes[0]->pos().x();
+            for (auto* n : nodes) ref = qMin(ref, n->pos().x());
+            for (auto* n : nodes) n->setPos(ref, n->pos().y());
+            break;
+        }
+        case 1: // Align Right
+        {
+            qreal ref = nodes[0]->pos().x() + OghamNodeItem::kNodeWidth;
+            for (auto* n : nodes) ref = qMax(ref, n->pos().x() + OghamNodeItem::kNodeWidth);
+            for (auto* n : nodes) n->setPos(ref - OghamNodeItem::kNodeWidth, n->pos().y());
+            break;
+        }
+        case 2: // Center H
+        {
+            qreal sum = 0.0;
+            for (auto* n : nodes) sum += n->pos().x() + OghamNodeItem::kNodeWidth * 0.5;
+            const qreal avg = sum / nodes.size();
+            for (auto* n : nodes)
+                n->setPos(avg - OghamNodeItem::kNodeWidth * 0.5, n->pos().y());
+            break;
+        }
+        case 3: // Align Top
+        {
+            qreal ref = nodes[0]->pos().y();
+            for (auto* n : nodes) ref = qMin(ref, n->pos().y());
+            for (auto* n : nodes) n->setPos(n->pos().x(), ref);
+            break;
+        }
+        case 4: // Align Bottom
+        {
+            qreal ref = nodes[0]->pos().y() + nodes[0]->boundingRect().height();
+            for (auto* n : nodes)
+                ref = qMax(ref, n->pos().y() + n->boundingRect().height());
+            for (auto* n : nodes)
+                n->setPos(n->pos().x(), ref - n->boundingRect().height());
+            break;
+        }
+        case 5: // Center V
+        {
+            qreal sum = 0.0;
+            for (auto* n : nodes)
+                sum += n->pos().y() + n->boundingRect().height() * 0.5;
+            const qreal avg = sum / nodes.size();
+            for (auto* n : nodes)
+                n->setPos(n->pos().x(), avg - n->boundingRect().height() * 0.5);
+            break;
+        }
+        case 6: // Distribute H (distribute left-edge X positions evenly)
+        {
+            if (nodes.size() < 3) break;
+            std::sort(nodes.begin(), nodes.end(),
+                [](OghamNodeItem* a, OghamNodeItem* b){ return a->pos().x() < b->pos().x(); });
+            const qreal x0 = nodes.front()->pos().x();
+            const qreal xN = nodes.back()->pos().x();
+            const int   N  = nodes.size();
+            for (int i = 1; i < N - 1; ++i)
+                nodes[i]->setPos(x0 + i * (xN - x0) / (N - 1), nodes[i]->pos().y());
+            break;
+        }
+        case 7: // Distribute V (distribute top-edge Y positions evenly)
+        {
+            if (nodes.size() < 3) break;
+            std::sort(nodes.begin(), nodes.end(),
+                [](OghamNodeItem* a, OghamNodeItem* b){ return a->pos().y() < b->pos().y(); });
+            const qreal y0 = nodes.front()->pos().y();
+            const qreal yN = nodes.back()->pos().y();
+            const int   N  = nodes.size();
+            for (int i = 1; i < N - 1; ++i)
+                nodes[i]->setPos(nodes[i]->pos().x(), y0 + i * (yN - y0) / (N - 1));
+            break;
+        }
+        default: break;
+        }
+
+        UpdateStatusBar();
+    }
+
+    // -------------------------------------------------------------------------
+    // Tree search / filter
+    // -------------------------------------------------------------------------
+
+    static bool ApplyTreeFilter(QTreeWidgetItem* item, const QString& text)
+    {
+        bool anyChildMatch = false;
+        for (int i = 0; i < item->childCount(); ++i)
+            if (ApplyTreeFilter(item->child(i), text))
+                anyChildMatch = true;
+
+        const QString tag = item->data(0, kRoleNodeTag).toString();
+        const int     ei  = item->data(0, kRoleEntryIdx).toInt();
+
+        bool visible;
+        if (text.isEmpty())
+            visible = true;
+        else if (ei < 0)
+            visible = anyChildMatch;
+        else
+            visible = tag.contains(text, Qt::CaseInsensitive);
+
+        item->setHidden(!visible && !anyChildMatch);
+        return visible || anyChildMatch;
+    }
+
+    void OghamStoryteller::OnTreeSearch(const QString& text)
+    {
+        for (int i = 0; i < m_tree->topLevelItemCount(); ++i)
+            ApplyTreeFilter(m_tree->topLevelItem(i), text);
+        if (!text.isEmpty())
+            m_tree->expandAll();
     }
 
 } // namespace FoundationOgham
