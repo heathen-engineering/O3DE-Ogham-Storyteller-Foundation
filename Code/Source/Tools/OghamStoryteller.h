@@ -50,6 +50,14 @@ namespace FoundationOgham
     // In-memory editing structures
     // -------------------------------------------------------------------------
 
+    /// One typed content slot in an entry — editor counterpart of OghamContentKey.
+    struct OghamSourceKey
+    {
+        QString type = QStringLiteral("Text");       // "Text"|"Image"|"Audio"|"Prefab"
+        QString mode = QStringLiteral("Localised");  // "Localised"|"Literal"|"Invariant"
+        QString key;
+    };
+
     /// One conditional check applied before showing an entry / option or executing an op.
     struct OghamCondition
     {
@@ -63,7 +71,7 @@ namespace FoundationOgham
     struct OghamOperation
     {
         QString                tag;
-        QString                arithmetic = QStringLiteral("Set"); // "Set","Add","Sub","Mul","Div","Min","Max"
+        QString                arithmetic = QStringLiteral("Set"); // "Set","Add","Subtract","Multiply","Divide","Min","Max"
         int                    value      = 0;
         QList<OghamCondition>  conditions;
     };
@@ -100,7 +108,7 @@ namespace FoundationOgham
     {
         QString                  tag;
         QPointF                  position;
-        QStringList              dataKeys;
+        QList<OghamSourceKey>    dataKeys;
         QList<OghamAliasPin>     aliasPins;
         QList<OghamSourceOption> options;
         QList<OghamOperation>    entryOperations;

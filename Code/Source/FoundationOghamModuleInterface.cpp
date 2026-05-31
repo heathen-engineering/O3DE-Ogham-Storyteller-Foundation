@@ -3,6 +3,7 @@
 #include <AzCore/Memory/Memory.h>
 
 #include <FoundationOgham/FoundationOghamTypeIds.h>
+#include <FoundationOgham/OghamTemplateProcessor.h>
 
 #include <Clients/FoundationOghamSystemComponent.h>
 
@@ -21,6 +22,7 @@ namespace FoundationOgham
         // This happens through the [MyComponent]::Reflect() function.
         m_descriptors.insert(m_descriptors.end(), {
             FoundationOghamSystemComponent::CreateDescriptor(),
+            OghamTemplateProcessor::CreateDescriptor(),
             });
     }
 

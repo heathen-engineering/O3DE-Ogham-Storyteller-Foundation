@@ -45,6 +45,12 @@ namespace FoundationOgham
             const AZStd::vector<DialogueOption>& availableOptions) = 0;
 
         ///<summary>
+        /// Fired when the player selects an option, before the conversation
+        /// navigates to the next entry (or closes).
+        ///</summary>
+        virtual void OnOptionSelected(const DialogueOption& option) = 0;
+
+        ///<summary>
         /// Fired when the active conversation ends.
         /// 'interrupted' — true if closed by CloseConversation(true) or by a
         ///                 new StartConversation call while one was already active.
@@ -170,14 +176,29 @@ namespace FoundationOgham
         /// Returns the current active entry, or nullptr if none.
         virtual const DialogueEntry* GetCurrentEntry() const = 0;
 
+        /// Finds any entry by tag across all registered assets. Returns nullptr if not found.
+        /// Used by OghamTemplateProcessor for lookahead pre-warming.
+        virtual const DialogueEntry* FindEntry(const Heathen::GameplayTag& tag) const = 0;
+
         /// Returns the options in the current entry whose conditions are satisfied.
         virtual AZStd::vector<DialogueOption> GetAvailableOptions() const = 0;
+
+        /// Returns all options in the current entry regardless of conditions.
+        /// Compare with GetAvailableOptions() to determine which options are gated.
+        virtual AZStd::vector<DialogueOption> GetAllOptions() const = 0;
+
+        /// Returns true if the named option's conditions are met in the current state.
+        /// Returns false if no conversation is active or the option is not found.
+        virtual bool IsOptionAvailable(const Heathen::GameplayTag& optionTag) const = 0;
 
         /// Returns the full narrative history (append-only, never cleared by ReturnTo).
         virtual const AZStd::vector<HistoryEntry>& GetHistory() const = 0;
 
         /// Returns the current narrative state collection.
         virtual const Heathen::GameplayTagCollection& GetNarrativeState() const = 0;
+
+        /// Returns a new collection containing only state entries at or below 'tag'.
+        virtual Heathen::GameplayTagCollection ReadState(const Heathen::GameplayTag& tag) const = 0;
 
         // -----------------------------------------------------------------
         // Save / Load
@@ -203,15 +224,36 @@ namespace FoundationOgham
         // -----------------------------------------------------------------
 
         ///<summary>
-        /// Clears all narrative state and history.
+        /// Clears all narrative state tags. Does not affect history.
         /// Does not close an active conversation or unregister assets.
         ///</summary>
         virtual void ClearState() = 0;
 
         ///<summary>
-        /// Direct write access to the narrative state.
+        /// Clears narrative state tags at or below 'tag'.
+        ///</summary>
+        virtual void ClearState(const Heathen::GameplayTag& tag) = 0;
+
+        ///<summary>
+        /// Clears the full conversation history.
+        ///</summary>
+        virtual void ClearHistory() = 0;
+
+        ///<summary>
+        /// Removes the last 'steps' entries from the conversation history.
+        /// Clamped to the current history length; no-op if steps <= 0.
+        ///</summary>
+        virtual void ClearHistory(AZ::s32 steps) = 0;
+
+        ///<summary>
+        /// Direct write access to the narrative state — applies a single operation.
         ///</summary>
         virtual void ApplyOperation(const Heathen::GameplayTagOperation& op) = 0;
+
+        ///<summary>
+        /// Applies multiple operations to the narrative state in order.
+        ///</summary>
+        virtual void ApplyOperations(const AZStd::vector<Heathen::GameplayTagOperation>& ops) = 0;
     };
 
     class FoundationOghamBusTraits : public AZ::EBusTraits

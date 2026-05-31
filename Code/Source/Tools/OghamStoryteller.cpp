@@ -225,7 +225,7 @@ namespace FoundationOgham
     static const QStringList kModalComparisons = {
         "Exists","NotExists","Equal","NotEqual","Less","LessEqual","Greater","GreaterEqual"};
     static const QStringList kModalArithmetics = {
-        "Set","Add","Sub","Mul","Div","Min","Max"};
+        "Set","Add","Subtract","Multiply","Divide","Min","Max"};
     static const QStringList kModalLogicOps = {"And","Or","Xor"};
     static bool kModalIsNumeric(const QString& cmp)
     { return cmp != "Exists" && cmp != "NotExists"; }
@@ -238,16 +238,24 @@ namespace FoundationOgham
     {
     public:
         enum class Action { None, Assign, Create, Update };
-        struct Result { Action action = Action::None; QString key; QString value; };
+        struct Result
+        {
+            Action  action = Action::None;
+            QString key;
+            QString value;
+            QString type = QStringLiteral("Text");
+            QString mode = QStringLiteral("Localised");
+        };
 
         LexiconFieldModal(
-            const QString&     originalKey,
-            const QStringList& knownKeys,
+            const OghamSourceKey& sourceKey,
+            const QStringList&    knownKeys,
             std::function<QString(const QString&)> fetchValue,
-            QWidget*           parent = nullptr)
+            QWidget*              parent = nullptr)
             : QDialog(parent, Qt::Popup | Qt::FramelessWindowHint)
-            , m_originalKey(originalKey)
-            , m_originalValue(fetchValue(originalKey))
+            , m_originalKey(sourceKey.key)
+            , m_originalValue(sourceKey.mode == QLatin1String("Localised")
+                              ? fetchValue(sourceKey.key) : sourceKey.key)
             , m_fetchValue(std::move(fetchValue))
         {
             setMinimumWidth(380);
@@ -258,12 +266,24 @@ namespace FoundationOgham
             auto* form = new QFormLayout();
             form->setSpacing(6);
 
+            // Type / Mode row
+            auto* tmRow = new QHBoxLayout();
+            m_typeCombo = new QComboBox(this);
+            m_typeCombo->addItems({ "Text", "Image", "Audio", "Prefab" });
+            m_typeCombo->setCurrentText(sourceKey.type);
+            m_modeCombo = new QComboBox(this);
+            m_modeCombo->addItems({ "Localised", "Literal", "Invariant" });
+            m_modeCombo->setCurrentText(sourceKey.mode);
+            tmRow->addWidget(m_typeCombo, 1);
+            tmRow->addWidget(m_modeCombo, 1);
+            vl->addLayout(tmRow);
+
             // Key — editable combo with existing lexicon keys (no label)
             m_keyCombo = new QComboBox(this);
             m_keyCombo->setEditable(true);
             m_keyCombo->setInsertPolicy(QComboBox::NoInsert);
             m_keyCombo->addItems(knownKeys);
-            m_keyCombo->setCurrentText(originalKey);
+            m_keyCombo->setCurrentText(sourceKey.key);
             m_keyCombo->setPlaceholderText("Localisation key\xe2\x80\xa6");
             auto* cpl = new QCompleter(knownKeys, m_keyCombo);
             cpl->setCaseSensitivity(Qt::CaseInsensitive);
@@ -276,11 +296,12 @@ namespace FoundationOgham
             }
             vl->addWidget(m_keyCombo);
 
-            // Value — multi-line editable; fixed at 4 lines, grows with content up to 4 (no label)
+            // Value — multi-line editable (Literal/Invariant) or readonly preview (Localised)
             m_valueEdit = new QTextEdit(this);
             m_valueEdit->setAcceptRichText(false);
             m_valueEdit->setPlaceholderText("Localised text\xe2\x80\xa6");
             m_valueEdit->setPlainText(m_originalValue);
+            m_valueEdit->setReadOnly(sourceKey.mode == QLatin1String("Localised"));
             m_valueEdit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
             vl->addWidget(m_valueEdit);
 
@@ -300,6 +321,17 @@ namespace FoundationOgham
             }
             vl->addLayout(btnRow);
 
+            // Toggle value edit readonly when mode changes
+            connect(m_modeCombo, &QComboBox::currentTextChanged, this,
+                [this](const QString& mode)
+                {
+                    const bool localised = (mode == QLatin1String("Localised"));
+                    m_valueEdit->setReadOnly(localised);
+                    if (localised)
+                        m_valueEdit->setPlainText(
+                            m_fetchValue(m_keyCombo->currentText().trimmed()));
+                });
+
             // Only update value when user selects from dropdown or confirms with Enter on known key
             connect(m_keyCombo, QOverload<int>::of(&QComboBox::activated),
                     this, &LexiconFieldModal::onKeyActivated);
@@ -308,14 +340,21 @@ namespace FoundationOgham
             connect(m_valueEdit->document(), &QTextDocument::contentsChanged,
                     this, &LexiconFieldModal::onValueChanged);
 
-            connect(m_closeBtn,  &QPushButton::clicked, this, [this]
-            { m_result = {Action::None, {}, {}}; accept(); });
-            connect(m_assignBtn, &QPushButton::clicked, this, [this]
-            { m_result = {Action::Assign, m_keyCombo->currentText().trimmed(), m_valueEdit->toPlainText()}; accept(); });
-            connect(m_createBtn, &QPushButton::clicked, this, [this]
-            { m_result = {Action::Create, m_keyCombo->currentText().trimmed(), m_valueEdit->toPlainText()}; accept(); });
-            connect(m_updateBtn, &QPushButton::clicked, this, [this]
-            { m_result = {Action::Update, m_keyCombo->currentText().trimmed(), m_valueEdit->toPlainText()}; accept(); });
+            auto makeResult = [this](Action a) -> Result {
+                return { a,
+                         m_keyCombo->currentText().trimmed(),
+                         m_valueEdit->toPlainText(),
+                         m_typeCombo->currentText(),
+                         m_modeCombo->currentText() };
+            };
+            connect(m_closeBtn,  &QPushButton::clicked, this, [this, makeResult]
+            { m_result = makeResult(Action::None);   accept(); });
+            connect(m_assignBtn, &QPushButton::clicked, this, [this, makeResult]
+            { m_result = makeResult(Action::Assign); accept(); });
+            connect(m_createBtn, &QPushButton::clicked, this, [this, makeResult]
+            { m_result = makeResult(Action::Create); accept(); });
+            connect(m_updateBtn, &QPushButton::clicked, this, [this, makeResult]
+            { m_result = makeResult(Action::Update); accept(); });
             connect(m_cancelBtn, &QPushButton::clicked, this, &QDialog::reject);
 
             // Size the value edit to 4 lines on first show
@@ -411,6 +450,8 @@ namespace FoundationOgham
         Result    m_result;
         std::function<QString(const QString&)> m_fetchValue;
 
+        QComboBox*   m_typeCombo = nullptr;
+        QComboBox*   m_modeCombo = nullptr;
         QComboBox*   m_keyCombo  = nullptr;
         QTextEdit*   m_valueEdit = nullptr;
         QPushButton* m_closeBtn  = nullptr;
@@ -2091,10 +2132,29 @@ namespace FoundationOgham
             if (eo.contains("position"))
                 entry.position = ParsePoint(eo["position"].toObject());
 
-            // dataKeys is the current name; textKeys is the legacy fallback
-            const QString keysField = eo.contains("dataKeys") ? "dataKeys" : "textKeys";
-            const QJsonArray tks = eo[keysField].toArray();
-            for (const QJsonValue& tk : tks) entry.dataKeys.append(tk.toString());
+            // contentKeys (typed objects) takes precedence; dataKeys/textKeys are legacy fallback
+            if (eo.contains("contentKeys") && eo["contentKeys"].isArray())
+            {
+                for (const QJsonValue ckv : eo["contentKeys"].toArray())
+                {
+                    const QJsonObject cko = ckv.toObject();
+                    OghamSourceKey sk;
+                    sk.type = cko.value("type").toString(QStringLiteral("Text"));
+                    sk.mode = cko.value("mode").toString(QStringLiteral("Localised"));
+                    sk.key  = cko.value("key").toString();
+                    entry.dataKeys.append(sk);
+                }
+            }
+            else
+            {
+                const QString keysField = eo.contains("dataKeys") ? "dataKeys" : "textKeys";
+                for (const QJsonValue tk : eo[keysField].toArray())
+                {
+                    OghamSourceKey sk;
+                    sk.key = tk.toString();
+                    entry.dataKeys.append(sk);
+                }
+            }
 
             const QJsonArray pins = eo["aliasPins"].toArray();
             for (const QJsonValue& pv : pins)
@@ -2160,8 +2220,15 @@ namespace FoundationOgham
             eo["position"]        = SerialisePoint(entry.position);
             eo["entryOperations"] = SerialiseOperations(entry.entryOperations);
             QJsonArray tks;
-            for (const QString& k : entry.dataKeys) tks.append(k);
-            eo["dataKeys"] = tks;
+            for (const OghamSourceKey& sk : entry.dataKeys)
+            {
+                QJsonObject cko;
+                cko["type"] = sk.type;
+                cko["mode"] = sk.mode;
+                cko["key"]  = sk.key;
+                tks.append(cko);
+            }
+            eo["contentKeys"] = tks;
             QJsonArray pinsArr;
             for (const OghamAliasPin& pin : entry.aliasPins)
             {
@@ -2429,11 +2496,11 @@ namespace FoundationOgham
         auto& entry = entries[ei];
         if (rowIdx < 0 || rowIdx >= entry.dataKeys.size()) return;
 
-        const QString currentKey = entry.dataKeys[rowIdx];
+        const OghamSourceKey currentSk = entry.dataKeys[rowIdx];
         const QStringList known  = FetchKnownLexiconKeys();
         auto fetchVal = [this](const QString& k){ return FetchLexiconValueForKey(k); };
 
-        LexiconFieldModal dlg(currentKey, known, fetchVal, this);
+        LexiconFieldModal dlg(currentSk, known, fetchVal, this);
         dlg.adjustSize();
         dlg.move(ModalPos(screenPos, dlg));
 
@@ -2442,10 +2509,17 @@ namespace FoundationOgham
         const LexiconFieldModal::Result res = dlg.result();
         if (res.action == LexiconFieldModal::Action::None) return;
 
-        // Update the key in the data model for Assign/Create/Update
+        // Update the data model for Assign/Create/Update
         if (res.action != LexiconFieldModal::Action::Update)
         {
-            entry.dataKeys[rowIdx] = res.key;
+            entry.dataKeys[rowIdx] = OghamSourceKey{ res.type, res.mode, res.key };
+            SetFileDirty(fi, true);
+        }
+        else
+        {
+            // Update action: preserve key but allow type/mode changes
+            entry.dataKeys[rowIdx].type = res.type;
+            entry.dataKeys[rowIdx].mode = res.mode;
             SetFileDirty(fi, true);
         }
 
@@ -2466,7 +2540,7 @@ namespace FoundationOgham
         auto& entries = m_loadedFiles[fi].entries;
         if (ei < 0 || ei >= entries.size()) return;
 
-        entries[ei].dataKeys.append(QString());
+        entries[ei].dataKeys.append(OghamSourceKey{});
         SetFileDirty(fi, true);
         RebuildGraph();
 
@@ -3109,11 +3183,19 @@ namespace FoundationOgham
                     opLabels.append(op.tag + QStringLiteral(" ") + op.arithmetic
                                     + QStringLiteral(" ") + QString::number(op.value));
 
+                QStringList dataKeyIds;
                 QStringList dataLabels;
-                for (const QString& key : entry.dataKeys)
+                for (const OghamSourceKey& sk : entry.dataKeys)
                 {
-                    const QString val = key.isEmpty() ? QString() : FetchLexiconValueForKey(key);
-                    dataLabels.append(val.isEmpty() ? key : val);
+                    dataKeyIds.append(sk.key);
+                    QString val;
+                    if (sk.mode == QLatin1String("Localised"))
+                        val = sk.key.isEmpty() ? QString() : FetchLexiconValueForKey(sk.key);
+                    else
+                        val = sk.key;
+                    if (sk.type != QLatin1String("Text") && !sk.type.isEmpty())
+                        val = QString("[%1] %2").arg(sk.type, val.isEmpty() ? sk.key : val);
+                    dataLabels.append(val.isEmpty() ? sk.key : val);
                 }
 
                 const bool tagInReg = knownOghamTags.contains(entry.tag);
@@ -3136,7 +3218,7 @@ namespace FoundationOgham
                     ? m_loadedFiles[fi].fileColor
                     : kGraphFileColors[fi % kGraphFileColorCount];
                 auto* node = new OghamNodeItem(fi, ei, entry.tag, tagInReg,
-                    opLabels, entry.dataKeys, dataLabels, optLabels,
+                    opLabels, dataKeyIds, dataLabels, optLabels,
                     assignedLabels, entry.highlightColor, hdrColor);
 
                 node->setPos(entry.position);
@@ -3922,7 +4004,7 @@ namespace FoundationOgham
         }
 
         // ── Save original data fields before we mutate anything ─────────────────
-        const QStringList origDataKeys = lf.entries[ei].dataKeys;
+        const QList<OghamSourceKey> origDataKeys = lf.entries[ei].dataKeys;
         const QPointF     srcPos       = lf.entries[ei].position;
         static constexpr qreal kXGap  = OghamNodeItem::kNodeWidth + 60.0;
 

@@ -34,6 +34,7 @@ namespace FoundationOgham
     void OghamAsset::Reflect(AZ::ReflectContext* context)
     {
         // Ensure dependent types are reflected first.
+        //OghamContentKey::Reflect(context); // TEMP: disabled for crash diagnosis
         HistoryEntry::Reflect(context);
         DialogueOption::Reflect(context);
         DialogueEntry::Reflect(context);

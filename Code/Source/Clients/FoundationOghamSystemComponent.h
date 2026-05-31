@@ -86,9 +86,13 @@ namespace FoundationOgham
         // FoundationOghamRequestBus — queries
         bool IsConversationActive() const override;
         const DialogueEntry* GetCurrentEntry() const override;
+        const DialogueEntry* FindEntry(const Heathen::GameplayTag& tag) const override;
         AZStd::vector<DialogueOption> GetAvailableOptions() const override;
+        AZStd::vector<DialogueOption> GetAllOptions() const override;
+        bool IsOptionAvailable(const Heathen::GameplayTag& optionTag) const override;
         const AZStd::vector<HistoryEntry>& GetHistory() const override;
         const Heathen::GameplayTagCollection& GetNarrativeState() const override;
+        Heathen::GameplayTagCollection ReadState(const Heathen::GameplayTag& tag) const override;
 
         // -----------------------------------------------------------------------
         // FoundationOghamRequestBus — save / load
@@ -98,7 +102,11 @@ namespace FoundationOgham
         // -----------------------------------------------------------------------
         // FoundationOghamRequestBus — state management
         void ClearState() override;
+        void ClearState(const Heathen::GameplayTag& tag) override;
+        void ClearHistory() override;
+        void ClearHistory(AZ::s32 steps) override;
         void ApplyOperation(const Heathen::GameplayTagOperation& op) override;
+        void ApplyOperations(const AZStd::vector<Heathen::GameplayTagOperation>& ops) override;
 
     private:
         // -----------------------------------------------------------------------

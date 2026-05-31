@@ -108,16 +108,7 @@ namespace FoundationOgham
 
     void FoundationOghamEditorSystemComponent::OnMenuRegistrationHook()
     {
-        auto* menuManager = AZ::Interface<AzToolsFramework::MenuManagerInterface>::Get();
-        if (!menuManager)
-            return;
-
-        if (!menuManager->IsMenuRegistered("heathen.menu.tools"))
-        {
-            AzToolsFramework::MenuProperties props;
-            props.m_name = "Heathen Tools";
-            menuManager->RegisterMenu("heathen.menu.tools", props);
-        }
+        // The "heathen.menu.main" top-level menu is created by EditorExtensions.
     }
 
     void FoundationOghamEditorSystemComponent::OnMenuBindingHook()
@@ -126,17 +117,9 @@ namespace FoundationOgham
         if (!menuManager)
             return;
 
-        static bool s_submenuAdded = false;
-        if (!s_submenuAdded)
-        {
-            menuManager->AddSubMenuToMenu(
-                AZStd::string(EditorIdentifiers::ToolsMenuIdentifier),
-                "heathen.menu.tools", 9000);
-            s_submenuAdded = true;
-        }
-
-        menuManager->AddActionToMenu("heathen.menu.tools",
-            "heathen.action.oghamstoryteller", 200);
+        // Add Ogham Storyteller directly to the top-level Heathen menu.
+        menuManager->AddActionToMenu("heathen.menu.main",
+            "heathen.action.oghamstoryteller", 600);
     }
 
     void FoundationOghamEditorSystemComponent::OnActionRegistrationHook()
@@ -148,7 +131,7 @@ namespace FoundationOgham
         AzToolsFramework::ActionProperties props;
         props.m_name        = "Ogham Storyteller";
         props.m_description = "Open the Ogham Storyteller conversation editor";
-        props.m_category    = "Heathen Tools";
+        props.m_category    = "Heathen";
 
         actionManager->RegisterAction(
             AZStd::string(EditorIdentifiers::MainWindowActionContextIdentifier),

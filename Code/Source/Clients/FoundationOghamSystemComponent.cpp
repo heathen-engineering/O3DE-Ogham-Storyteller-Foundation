@@ -43,6 +43,7 @@ namespace FoundationOgham
             "{C3D4E5F6-A7B8-9C0D-1E2F-A3B4C5D6E7F8}",
             AZ::SystemAllocator,
             OnDialogueEntered,
+            OnOptionSelected,
             OnDialogueClosed);
 
         void OnDialogueEntered(
@@ -50,6 +51,11 @@ namespace FoundationOgham
             const AZStd::vector<DialogueOption>& availableOptions) override
         {
             Call(FN_OnDialogueEntered, entry, availableOptions);
+        }
+
+        void OnOptionSelected(const DialogueOption& option) override
+        {
+            Call(FN_OnOptionSelected, option);
         }
 
         void OnDialogueClosed(bool interrupted) override
@@ -124,8 +130,6 @@ namespace FoundationOgham
                     &FoundationOghamRequests::LoadSaveState,
                     {{{ "Save State", "Snapshot previously created by Create Save State" }}})
                 // ---- State management ----
-                ->Event("Clear State",
-                    &FoundationOghamRequests::ClearState)
                 ->Event("Apply Operation",
                     &FoundationOghamRequests::ApplyOperation,
                     {{{ "Operation", "GameplayTagOperation to apply to the narrative state" }}});
@@ -310,6 +314,9 @@ namespace FoundationOgham
         if (!chosen)
             return false;
 
+        // Notify before navigation so listeners can react to the selection itself.
+        OghamNotificationBus::Broadcast(&OghamNotifications::OnOptionSelected, *chosen);
+
         // Apply option operations.
         for (const Heathen::GameplayTagOperation& op : chosen->operations)
             op.Apply(m_state);
@@ -415,12 +422,40 @@ namespace FoundationOgham
         return FindEntry(m_currentEntryId);
     }
 
+    const DialogueEntry* FoundationOghamSystemComponent::FindEntry(
+        const Heathen::GameplayTag& tag) const
+    {
+        return FindEntry(tag.GetId());
+    }
+
     AZStd::vector<DialogueOption> FoundationOghamSystemComponent::GetAvailableOptions() const
     {
         const DialogueEntry* entry = GetCurrentEntry();
         if (!entry)
             return {};
         return BuildAvailableOptions(*entry);
+    }
+
+    AZStd::vector<DialogueOption> FoundationOghamSystemComponent::GetAllOptions() const
+    {
+        const DialogueEntry* entry = GetCurrentEntry();
+        if (!entry)
+            return {};
+        return entry->options;
+    }
+
+    bool FoundationOghamSystemComponent::IsOptionAvailable(
+        const Heathen::GameplayTag& optionTag) const
+    {
+        const DialogueEntry* entry = GetCurrentEntry();
+        if (!entry)
+            return false;
+        for (const DialogueOption& opt : entry->options)
+        {
+            if (opt.tag.GetId() == optionTag.GetId())
+                return Heathen::EvaluateConditions(opt.conditions, m_state);
+        }
+        return false;
     }
 
     const AZStd::vector<HistoryEntry>& FoundationOghamSystemComponent::GetHistory() const
@@ -431,6 +466,16 @@ namespace FoundationOgham
     const Heathen::GameplayTagCollection& FoundationOghamSystemComponent::GetNarrativeState() const
     {
         return m_state;
+    }
+
+    Heathen::GameplayTagCollection FoundationOghamSystemComponent::ReadState(
+        const Heathen::GameplayTag& tag) const
+    {
+        Heathen::GameplayTagCollection result;
+        const auto matching = m_state.GetMatchingTags(tag, false);
+        for (const Heathen::GameplayTag& t : matching)
+            result.Apply(t, Heathen::GameplayTagArithmetic::Set, m_state.GetValue(t));
+        return result;
     }
 
     ////////////////////////////////////////////////////////////////////////////
@@ -462,13 +507,41 @@ namespace FoundationOgham
     void FoundationOghamSystemComponent::ClearState()
     {
         m_state.Clear();
+    }
+
+    void FoundationOghamSystemComponent::ClearState(const Heathen::GameplayTag& tag)
+    {
+        const auto toRemove = m_state.GetMatchingTags(tag, false);
+        for (const Heathen::GameplayTag& t : toRemove)
+            m_state.RemoveTag(t);
+    }
+
+    void FoundationOghamSystemComponent::ClearHistory()
+    {
         m_history.clear();
+    }
+
+    void FoundationOghamSystemComponent::ClearHistory(AZ::s32 steps)
+    {
+        if (steps <= 0)
+            return;
+        const AZ::s32 count = static_cast<AZ::s32>(m_history.size());
+        const AZ::s32 removeCount = AZStd::min(steps, count);
+        if (removeCount > 0)
+            m_history.erase(m_history.end() - removeCount, m_history.end());
     }
 
     void FoundationOghamSystemComponent::ApplyOperation(
         const Heathen::GameplayTagOperation& op)
     {
         op.Apply(m_state);
+    }
+
+    void FoundationOghamSystemComponent::ApplyOperations(
+        const AZStd::vector<Heathen::GameplayTagOperation>& ops)
+    {
+        for (const Heathen::GameplayTagOperation& op : ops)
+            op.Apply(m_state);
     }
 
     ////////////////////////////////////////////////////////////////////////////

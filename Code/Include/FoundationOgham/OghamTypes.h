@@ -18,6 +18,7 @@
 #pragma once
 
 #include <AzCore/Memory/SystemAllocator.h>
+#include <AzCore/Preprocessor/EnumReflectUtils.h>
 #include <AzCore/RTTI/RTTI.h>
 #include <AzCore/Serialization/SerializeContext.h>
 #include <AzCore/std/containers/vector.h>
@@ -31,6 +32,52 @@
 
 namespace FoundationOgham
 {
+    // -------------------------------------------------------------------------
+    // OghamContentType — the kind of content a content key resolves to.
+    // -------------------------------------------------------------------------
+    AZ_ENUM_CLASS_WITH_UNDERLYING_TYPE(OghamContentType, AZ::u8,
+        Text,
+        Image,
+        Audio,
+        Prefab
+    );
+
+    AZ_ENUM_DEFINE_REFLECT_UTILITIES(OghamContentType)
+
+    // -------------------------------------------------------------------------
+    // OghamLocMode — how a content key's keyOrValue field is interpreted.
+    // -------------------------------------------------------------------------
+    AZ_ENUM_CLASS_WITH_UNDERLYING_TYPE(OghamLocMode, AZ::u8,
+        Localised,   ///< keyOrValue is a Lexicon dot-path resolved at runtime
+        Literal,     ///< keyOrValue is used verbatim — no Lexicon lookup
+        Invariant    ///< like Literal but marked as intentionally untranslated
+    );
+
+    AZ_ENUM_DEFINE_REFLECT_UTILITIES(OghamLocMode)
+    // -------------------------------------------------------------------------
+    // OghamContentKey
+    // -------------------------------------------------------------------------
+
+    ///<summary>
+    /// One typed content slot within a DialogueEntry.
+    ///
+    /// type       — determines what kind of asset or text this key resolves to.
+    /// mode       — Localised: keyOrValue is a Lexicon dot-path.
+    ///              Literal / Invariant: keyOrValue is used verbatim.
+    /// keyOrValue — the Lexicon key (Localised) or raw string (Literal/Invariant).
+    ///</summary>
+    struct OghamContentKey
+    {
+        AZ_TYPE_INFO(OghamContentKey, "{D7F35CED-14D1-4842-918E-FE577A9D9F7F}")
+        AZ_CLASS_ALLOCATOR(OghamContentKey, AZ::SystemAllocator, 0)
+
+        OghamContentType type     = OghamContentType::Text;
+        OghamLocMode     mode     = OghamLocMode::Localised;
+        AZStd::string    keyOrValue;
+
+        static void Reflect(AZ::ReflectContext* context);
+    };
+
     // -------------------------------------------------------------------------
     // HistoryEntry
     // -------------------------------------------------------------------------
@@ -89,7 +136,8 @@ namespace FoundationOgham
     ///<summary>
     /// One node in the narrative graph.
     ///
-    /// textKeys        — one or more localisation keys (narrator, speaker, body …).
+    /// contentKeys     — typed content slots (text, image, audio, prefab) for narrator,
+    ///                   speaker, body, etc. The UI layer decides how to use each slot.
     ///                   The UI layer decides how to display them.
     /// parentTag       — hierarchical parent used by ReturnTo().  Set to the
     ///                   parent entry's tag; leave invalid for root entries.
@@ -103,7 +151,7 @@ namespace FoundationOgham
 
         Heathen::GameplayTag                         tag;
         Heathen::GameplayTag                         parentTag;
-        AZStd::vector<AZStd::string>                 textKeys;
+        AZStd::vector<OghamContentKey>               contentKeys;
         AZStd::vector<Heathen::GameplayTagOperation> entryOperations;
         AZStd::vector<DialogueOption>                options;
 
@@ -139,3 +187,6 @@ namespace FoundationOgham
     };
 
 } // namespace FoundationOgham
+
+AZ_TYPE_INFO_SPECIALIZE(FoundationOgham::OghamContentType, "{B0509589-8867-42A3-8CF5-B914D5A70A3B}")
+AZ_TYPE_INFO_SPECIALIZE(FoundationOgham::OghamLocMode,     "{B59DCDCD-17E7-47CA-98CF-A40EB4CB3A68}")

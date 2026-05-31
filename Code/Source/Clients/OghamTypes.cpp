@@ -28,6 +28,54 @@
 namespace FoundationOgham
 {
     ////////////////////////////////////////////////////////////////////////////
+    // OghamContentKey
+
+    void OghamContentKey::Reflect(AZ::ReflectContext* context)
+    {
+        if (auto* serialize = azrtti_cast<AZ::SerializeContext*>(context))
+        {
+            serialize->Enum<OghamContentType>()
+                ->Value("Text",   OghamContentType::Text)
+                ->Value("Image",  OghamContentType::Image)
+                ->Value("Audio",  OghamContentType::Audio)
+                ->Value("Prefab", OghamContentType::Prefab);
+
+            serialize->Enum<OghamLocMode>()
+                ->Value("Localised", OghamLocMode::Localised)
+                ->Value("Literal",   OghamLocMode::Literal)
+                ->Value("Invariant", OghamLocMode::Invariant);
+
+            serialize->Class<OghamContentKey>()
+                ->Version(1)
+                ->Field("Type",       &OghamContentKey::type)
+                ->Field("Mode",       &OghamContentKey::mode)
+                ->Field("KeyOrValue", &OghamContentKey::keyOrValue);
+
+            if (auto* edit = serialize->GetEditContext())
+            {
+                edit->Class<OghamContentKey>("Content Key",
+                        "A typed, mode-aware content reference within a dialogue entry.")
+                    ->ClassElement(AZ::Edit::ClassElements::EditorData, "")
+                        ->Attribute(AZ::Edit::Attributes::AutoExpand, true)
+                    ->DataElement(AZ::Edit::UIHandlers::Default, &OghamContentKey::type,
+                        "Type", "The kind of content this key resolves to")
+                    ->DataElement(AZ::Edit::UIHandlers::Default, &OghamContentKey::mode,
+                        "Mode", "How keyOrValue is interpreted: Localised, Literal, or Invariant")
+                    ->DataElement(AZ::Edit::UIHandlers::Default, &OghamContentKey::keyOrValue,
+                        "Key / Value", "Lexicon dot-path (Localised) or raw string (Literal/Invariant)");
+            }
+        }
+
+        if (auto* behavior = azrtti_cast<AZ::BehaviorContext*>(context))
+        {
+            behavior->Class<OghamContentKey>("Ogham Content Key")
+                ->Attribute(AZ::Script::Attributes::Category, "Ogham")
+                ->Constructor<>()
+                ->Property("keyOrValue", BehaviorValueProperty(&OghamContentKey::keyOrValue));
+        }
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
     // HistoryEntry
 
     void HistoryEntry::Reflect(AZ::ReflectContext* context)
@@ -119,10 +167,10 @@ namespace FoundationOgham
         if (auto* serialize = azrtti_cast<AZ::SerializeContext*>(context))
         {
             serialize->Class<DialogueEntry>()
-                ->Version(1)
+                ->Version(2)
                 ->Field("Tag",             &DialogueEntry::tag)
                 ->Field("ParentTag",       &DialogueEntry::parentTag)
-                ->Field("TextKeys",        &DialogueEntry::textKeys)
+                ->Field("ContentKeys",     &DialogueEntry::contentKeys)
                 ->Field("EntryOperations", &DialogueEntry::entryOperations)
                 ->Field("Options",         &DialogueEntry::options);
 
@@ -137,9 +185,9 @@ namespace FoundationOgham
                     ->DataElement(AZ::Edit::UIHandlers::Default, &DialogueEntry::parentTag,
                         "Parent Tag",
                         "Hierarchical parent; used by ReturnTo(). Leave invalid for root entries.")
-                    ->DataElement(AZ::Edit::UIHandlers::Default, &DialogueEntry::textKeys,
-                        "Text Keys",
-                        "Localisation keys for display strings (narrator, body, speaker, etc.)")
+                    ->DataElement(AZ::Edit::UIHandlers::Default, &DialogueEntry::contentKeys,
+                        "Content Keys",
+                        "Typed content references (text, image, audio, prefab) for this entry.")
                     ->DataElement(AZ::Edit::UIHandlers::Default, &DialogueEntry::entryOperations,
                         "Entry Operations",
                         "State changes applied when this entry is entered.")
@@ -155,7 +203,7 @@ namespace FoundationOgham
                 ->Constructor<>()
                 ->Property("tag",             BehaviorValueProperty(&DialogueEntry::tag))
                 ->Property("parentTag",       BehaviorValueProperty(&DialogueEntry::parentTag))
-                ->Property("textKeys",        BehaviorValueProperty(&DialogueEntry::textKeys))
+                ->Property("contentKeys",     BehaviorValueProperty(&DialogueEntry::contentKeys))
                 ->Property("entryOperations", BehaviorValueProperty(&DialogueEntry::entryOperations))
                 ->Property("options",         BehaviorValueProperty(&DialogueEntry::options));
         }

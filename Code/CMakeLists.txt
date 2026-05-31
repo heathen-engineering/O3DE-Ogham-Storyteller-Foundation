@@ -30,6 +30,7 @@ ly_add_target(
     BUILD_DEPENDENCIES
         INTERFACE
            AZ::AzCore
+           Gem::FoundationGameplayTags.API
 )
 
 # The ${gem_name}.Private.Object target is an internal target
@@ -53,6 +54,7 @@ ly_add_target(
             Gem::FoundationGameplayTags.API
             Gem::xxHash.API
             Gem::FoundationHeathenWidgets.API
+            Gem::FoundationLocalisation.API
 )
 
 # Here add ${gem_name} target, it depends on the Private Object library and Public API interface

@@ -198,11 +198,13 @@ namespace FoundationOgham
         m_textLabel->setStyleSheet("font-size: 16px; padding: 8px 0px;");
 
         QStringList textLines;
-        for (const QString& key : entry.dataKeys)
+        for (const OghamSourceKey& sk : entry.dataKeys)
         {
-            const QString resolved = resolveText(key);
+            const QString resolved = (sk.mode == QLatin1String("Localised"))
+                ? resolveText(sk.key)
+                : sk.key;
             textLines.append(resolved.isEmpty()
-                ? QStringLiteral("[%1]").arg(key)
+                ? QStringLiteral("[%1]").arg(sk.key)
                 : resolved);
         }
         m_textLabel->setText(textLines.isEmpty()
@@ -340,9 +342,9 @@ namespace FoundationOgham
             int val = m_tagState.value(op.tag, 0);
             if      (op.arithmetic == "Set") val  = op.value;
             else if (op.arithmetic == "Add") val += op.value;
-            else if (op.arithmetic == "Sub") val -= op.value;
-            else if (op.arithmetic == "Mul") val *= op.value;
-            else if (op.arithmetic == "Div") val  = (op.value != 0) ? val / op.value : val;
+            else if (op.arithmetic == "Subtract") val -= op.value;
+            else if (op.arithmetic == "Multiply") val *= op.value;
+            else if (op.arithmetic == "Divide")   val  = (op.value != 0) ? val / op.value : val;
             else if (op.arithmetic == "Min") val  = qMin(val, op.value);
             else if (op.arithmetic == "Max") val  = qMax(val, op.value);
             m_tagState[op.tag] = val;

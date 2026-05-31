@@ -4,4 +4,5 @@ set(FILES
     Include/FoundationOgham/FoundationOghamTypeIds.h
     Include/FoundationOgham/OghamTypes.h
     Include/FoundationOgham/OghamAsset.h
+    Include/FoundationOgham/OghamTemplateProcessor.h
 )

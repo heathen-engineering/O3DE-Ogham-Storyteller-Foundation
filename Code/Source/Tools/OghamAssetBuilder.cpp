@@ -76,13 +76,28 @@ namespace FoundationOgham
         Heathen::GameplayTagArithmetic ParseArithmetic(const char* s)
         {
             using E = Heathen::GameplayTagArithmetic;
-            if (!strcmp(s, "Add")) return E::Add;
-            if (!strcmp(s, "Sub")) return E::Sub;
-            if (!strcmp(s, "Mul")) return E::Mul;
-            if (!strcmp(s, "Div")) return E::Div;
-            if (!strcmp(s, "Min")) return E::Min;
-            if (!strcmp(s, "Max")) return E::Max;
+            if (!strcmp(s, "Add"))      return E::Add;
+            if (!strcmp(s, "Subtract")) return E::Subtract;
+            if (!strcmp(s, "Multiply")) return E::Multiply;
+            if (!strcmp(s, "Divide"))   return E::Divide;
+            if (!strcmp(s, "Min"))      return E::Min;
+            if (!strcmp(s, "Max"))      return E::Max;
             return E::Set; // default
+        }
+
+        OghamContentType ParseContentType(const char* s)
+        {
+            if (!strcmp(s, "Image"))  return OghamContentType::Image;
+            if (!strcmp(s, "Audio"))  return OghamContentType::Audio;
+            if (!strcmp(s, "Prefab")) return OghamContentType::Prefab;
+            return OghamContentType::Text; // default
+        }
+
+        OghamLocMode ParseLocMode(const char* s)
+        {
+            if (!strcmp(s, "Literal"))   return OghamLocMode::Literal;
+            if (!strcmp(s, "Invariant")) return OghamLocMode::Invariant;
+            return OghamLocMode::Localised; // default
         }
 
         ////////////////////////////////////////////////////////////////////////
@@ -114,6 +129,9 @@ namespace FoundationOgham
 
                 if (obj.HasMember("logicOp") && obj["logicOp"].IsString())
                     cond.logicOp = ParseLogicOp(obj["logicOp"].GetString());
+
+                if (obj.HasMember("compareTag") && obj["compareTag"].IsString())
+                    cond.compareTag = HashTag(obj["compareTag"].GetString());
 
                 result.push_back(AZStd::move(cond));
             }
@@ -282,14 +300,39 @@ namespace FoundationOgham
             if (entryVal.HasMember("parentTag") && entryVal["parentTag"].IsString())
                 entry.parentTag = HashTag(entryVal["parentTag"].GetString());
 
-            // dataKeys is the current name; textKeys is the legacy fallback
-            const char* keysField = entryVal.HasMember("dataKeys") ? "dataKeys" : "textKeys";
-            if (entryVal.HasMember(keysField) && entryVal[keysField].IsArray())
+            // contentKeys (new typed format) takes precedence.
+            // dataKeys / textKeys (legacy plain-string format) are the fallback.
+            if (entryVal.HasMember("contentKeys") && entryVal["contentKeys"].IsArray())
             {
-                for (const auto& tk : entryVal[keysField].GetArray())
+                for (const auto& ck : entryVal["contentKeys"].GetArray())
                 {
-                    if (tk.IsString())
-                        entry.textKeys.push_back(tk.GetString());
+                    if (!ck.IsObject()) continue;
+                    OghamContentKey key;
+                    if (ck.HasMember("type") && ck["type"].IsString())
+                        key.type = ParseContentType(ck["type"].GetString());
+                    if (ck.HasMember("mode") && ck["mode"].IsString())
+                        key.mode = ParseLocMode(ck["mode"].GetString());
+                    if (ck.HasMember("key") && ck["key"].IsString())
+                        key.keyOrValue = ck["key"].GetString();
+                    entry.contentKeys.push_back(AZStd::move(key));
+                }
+            }
+            else
+            {
+                // Legacy: plain string array — treat each as {Text, Localised, key}
+                const char* keysField =
+                    entryVal.HasMember("dataKeys") ? "dataKeys" : "textKeys";
+                if (entryVal.HasMember(keysField) && entryVal[keysField].IsArray())
+                {
+                    for (const auto& tk : entryVal[keysField].GetArray())
+                    {
+                        if (tk.IsString())
+                        {
+                            OghamContentKey key;
+                            key.keyOrValue = tk.GetString();
+                            entry.contentKeys.push_back(AZStd::move(key));
+                        }
+                    }
                 }
             }
 
