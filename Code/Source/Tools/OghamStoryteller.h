@@ -154,12 +154,13 @@ namespace FoundationOgham
         void closeEvent(QCloseEvent* event) override;
 
     private slots:
-        void OnNewFile();
+        void OnSupport();
+        void OnDocs();
         void OnSaveAll();
-        void OnOpenSource();
+        void OnSnapToggle();
         void OnLayoutGraph();
         void OnPlayFromNode();
-        void OnSnapToggle();
+        void OnImport();
         void OnTreeSearch(const QString& text);
 
     private:
@@ -167,6 +168,8 @@ namespace FoundationOgham
         void    ScanAndLoadAll();
         bool    ParseFile(const QString& path, LoadedFile& lf);
         bool    SaveFile(int fileIdx);
+        void    OnNewFile();
+        void    OnOpenSource();
 
         // ── Tree building ────────────────────────────────────────────────────
         void     RebuildTree();
@@ -247,12 +250,13 @@ namespace FoundationOgham
         void        ShowAddTagDialog(const QString& tag, QToolButton* btn);
 
         // ── Toolbar ──────────────────────────────────────────────────────────
-        QPushButton*    m_newFileBtn      = nullptr;
+        QPushButton*    m_supportBtn      = nullptr;
+        QPushButton*    m_docsBtn         = nullptr;
         QPushButton*    m_saveAllBtn      = nullptr;
-        QPushButton*    m_openSrcBtn      = nullptr;
-        QPushButton*    m_layoutBtn       = nullptr;
         QPushButton*    m_snapBtn         = nullptr;
-        QPushButton*    m_playFromNodeBtn = nullptr;  ///< in toolbar (no form panel)
+        QPushButton*    m_layoutBtn       = nullptr;
+        QPushButton*    m_playFromNodeBtn = nullptr;
+        QPushButton*    m_importBtn       = nullptr;
 
         // ── Tree search ───────────────────────────────────────────────────────
         QLineEdit*      m_treeSearch      = nullptr;

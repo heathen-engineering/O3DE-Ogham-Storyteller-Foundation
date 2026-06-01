@@ -32,6 +32,7 @@
 #include <QScreen>
 #include <QCloseEvent>
 #include <QColorDialog>
+#include <QRegularExpression>
 #include <QComboBox>
 #include <QCompleter>
 #include <QGraphicsScene>
@@ -53,8 +54,8 @@
 #include <QFileSystemWatcher>
 #include <QEvent>
 #include <QFormLayout>
-#include <QKeyEvent>
 #include <QFrame>
+#include <QKeyEvent>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QJsonArray>
@@ -231,254 +232,606 @@ namespace FoundationOgham
     { return cmp != "Exists" && cmp != "NotExists"; }
 
     // =========================================================================
-    // LexiconFieldModal — inline editor for a single data-key row
+    // OghamLexiconKeyEditPopup
+    //
+    // Matches Unity's OghamKeyEditWindow:
+    //
+    //   [Type ▼][Mode ▼]                         [Save][✕]
+    //   [B][I][U] [■][A][✕A] [─pt─▼] [🔗] [Formatted]   ← Text type only
+    //   [ ──── content text area (rendered preview / source) ──────────── ]
+    //   [ link panel ─────────────────────────── ]   ← collapsible
+    //   [ lexicon key field ──────────── ][▾]         ← Localised mode only
+    //
+    // Default mode: Formatted (markdown rendered as HTML, read-only).
+    // "Formatted" / "Source" button toggles between preview and editable source.
+    //
+    // Data model:
+    //   Localised: m_editKey = lexicon lookup key, m_editVal = resolved/edited text
+    //   Literal:   m_editKey = "", m_editVal = the text content (stored as sourceKey.key)
+    //   If fetchValue(key) is empty the key IS the content (legacy/no-lexicon data).
+    //
+    // Commits on Save or focus-loss; Escape cancels.
     // =========================================================================
 
-    class LexiconFieldModal : public QDialog
+    // Inline helper — converts Ogham markdown+TMPro subset to Qt-compatible HTML.
+    static QString oghamToHtml(const QString& md)
     {
+        QString s = md;
+        s.replace("\n", "<br>");
+        // Bold **text**
+        s.replace(QRegularExpression(R"(\*\*(.+?)\*\*)"), "<b>\\1</b>");
+        // Italic *text* (don't match **)
+        s.replace(QRegularExpression(R"((?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*))"), "<i>\\1</i>");
+        // Underline <u>text</u> passes through as valid HTML — no transform needed
+        // TMPro color <color=#hex>text</color>
+        s.replace(QRegularExpression(R"(<color=#([0-9A-Fa-f]{3,8})>(.*?)</color>)",
+                                     QRegularExpression::DotMatchesEverythingOption),
+                  "<span style='color:#\\1'>\\2</span>");
+        // TMPro size <size=N>text</size>
+        s.replace(QRegularExpression(R"(<size=(\d+)>(.*?)</size>)",
+                                     QRegularExpression::DotMatchesEverythingOption),
+                  "<span style='font-size:\\1pt'>\\2</span>");
+        // Links [display](target) → styled underline
+        s.replace(QRegularExpression(R"(\[([^\]]+)\]\([^)]*\))"),
+                  "<a style='color:#6ab0d0;text-decoration:underline'>\\1</a>");
+        return "<div style='white-space:pre-wrap;font-family:sans-serif;font-size:10pt;color:#e0e0e0;'>"
+               + s + "</div>";
+    }
+
+    class OghamLexiconKeyEditPopup : public QFrame
+    {
+        Q_OBJECT
+        using FetchValFn = std::function<QString(const QString&)>;
     public:
-        enum class Action { None, Assign, Create, Update };
+        enum class LexiconWrite { None, Write };
         struct Result
         {
-            Action  action = Action::None;
-            QString key;
-            QString value;
-            QString type = QStringLiteral("Text");
-            QString mode = QStringLiteral("Localised");
+            LexiconWrite lexiconWrite = LexiconWrite::None;
+            QString      diskKey;
+            QString      lexValue;
+            QString      type;
+            QString      mode;
         };
 
-        LexiconFieldModal(
+        OghamLexiconKeyEditPopup(
             const OghamSourceKey& sourceKey,
             const QStringList&    knownKeys,
-            std::function<QString(const QString&)> fetchValue,
+            FetchValFn            fetchValue,
             QWidget*              parent = nullptr)
-            : QDialog(parent, Qt::Popup | Qt::FramelessWindowHint)
-            , m_originalKey(sourceKey.key)
-            , m_originalValue(sourceKey.mode == QLatin1String("Localised")
-                              ? fetchValue(sourceKey.key) : sourceKey.key)
+            : QFrame(parent, Qt::Popup | Qt::FramelessWindowHint)
+            , m_knownKeys(knownKeys)
             , m_fetchValue(std::move(fetchValue))
         {
-            setMinimumWidth(380);
+            setAttribute(Qt::WA_DeleteOnClose);
+            setFrameShape(QFrame::StyledPanel);
+            setFixedWidth(620);
+
             auto* vl = new QVBoxLayout(this);
-            vl->setSpacing(8);
-            vl->setContentsMargins(12, 12, 12, 12);
+            vl->setSpacing(4);
+            vl->setContentsMargins(8, 8, 8, 8);
 
-            auto* form = new QFormLayout();
-            form->setSpacing(6);
-
-            // Type / Mode row
-            auto* tmRow = new QHBoxLayout();
-            m_typeCombo = new QComboBox(this);
-            m_typeCombo->addItems({ "Text", "Image", "Audio", "Prefab" });
-            m_typeCombo->setCurrentText(sourceKey.type);
-            m_modeCombo = new QComboBox(this);
-            m_modeCombo->addItems({ "Localised", "Literal", "Invariant" });
-            m_modeCombo->setCurrentText(sourceKey.mode);
-            tmRow->addWidget(m_typeCombo, 1);
-            tmRow->addWidget(m_modeCombo, 1);
-            vl->addLayout(tmRow);
-
-            // Key — editable combo with existing lexicon keys (no label)
-            m_keyCombo = new QComboBox(this);
-            m_keyCombo->setEditable(true);
-            m_keyCombo->setInsertPolicy(QComboBox::NoInsert);
-            m_keyCombo->addItems(knownKeys);
-            m_keyCombo->setCurrentText(sourceKey.key);
-            m_keyCombo->setPlaceholderText("Localisation key\xe2\x80\xa6");
-            auto* cpl = new QCompleter(knownKeys, m_keyCombo);
-            cpl->setCaseSensitivity(Qt::CaseInsensitive);
-            cpl->setFilterMode(Qt::MatchContains);
-            m_keyCombo->setCompleter(cpl);
-            // Block Enter/Return on the key line edit so it doesn't close the dialog
-            if (auto* le = m_keyCombo->lineEdit())
+            // ── Row 1: [Type][Mode]              [Save][✕] ────────────────────
             {
-                le->installEventFilter(this);
-            }
-            vl->addWidget(m_keyCombo);
+                auto* row = new QHBoxLayout();
+                row->setSpacing(4);
 
-            // Value — multi-line editable (Literal/Invariant) or readonly preview (Localised)
+                m_typeCombo = new QComboBox(this);
+                m_typeCombo->addItems({ "Text", "Image", "Audio", "Prefab" });
+                m_typeCombo->setCurrentText(sourceKey.type);
+                m_typeCombo->setFixedWidth(80);
+                row->addWidget(m_typeCombo);
+
+                m_modeCombo = new QComboBox(this);
+                m_modeCombo->addItems({ "Localised", "Literal", "Invariant" });
+                m_modeCombo->setCurrentText(sourceKey.mode);
+                m_modeCombo->setFixedWidth(100);
+                row->addWidget(m_modeCombo);
+
+                row->addStretch();
+
+                auto* saveBtn = new QPushButton("Save", this);
+                saveBtn->setFixedWidth(48);
+                saveBtn->setDefault(false); saveBtn->setAutoDefault(false);
+                row->addWidget(saveBtn);
+
+                auto* cancelBtn = new QPushButton("\xe2\x9c\x95", this);
+                cancelBtn->setFixedWidth(26);
+                cancelBtn->setDefault(false); cancelBtn->setAutoDefault(false);
+                row->addWidget(cancelBtn);
+
+                connect(saveBtn,   &QPushButton::clicked, this, [this]{ hide(); });
+                connect(cancelBtn, &QPushButton::clicked, this, [this]{ m_cancelled = true; hide(); });
+                vl->addLayout(row);
+            }
+
+            // ── Row 2: Formatting toolbar (Text type only) ────────────────────
+            m_fmtRow = new QWidget(this);
+            {
+                auto* fmtL = new QHBoxLayout(m_fmtRow);
+                fmtL->setContentsMargins(0, 2, 0, 2);
+                fmtL->setSpacing(2);
+
+                auto mkBtn = [&](const QString& label, const QString& tip, const QString& css = {}) {
+                    auto* b = new QPushButton(label, m_fmtRow);
+                    b->setFixedSize(26, 22);
+                    b->setToolTip(tip);
+                    b->setDefault(false); b->setAutoDefault(false);
+                    b->setFocusPolicy(Qt::NoFocus);
+                    if (!css.isEmpty()) b->setStyleSheet(css);
+                    fmtL->addWidget(b);
+                    return b;
+                };
+
+                auto* boldBtn   = mkBtn("B",    "Bold (**text**)",         "QPushButton{font-weight:bold;}");
+                auto* italicBtn = mkBtn("I",    "Italic (*text*)",          "QPushButton{font-style:italic;}");
+                auto* underBtn  = mkBtn("U",    "Underline (<u>text</u>)", "QPushButton{text-decoration:underline;}");
+
+                fmtL->addSpacing(6);
+
+                // Color swatch — shows active color, click to pick
+                m_colorBtn = new QPushButton(m_fmtRow);
+                m_colorBtn->setFixedSize(26, 22);
+                m_colorBtn->setToolTip("Text color");
+                m_colorBtn->setDefault(false); m_colorBtn->setAutoDefault(false);
+                m_colorBtn->setFocusPolicy(Qt::NoFocus);
+                updateColorBtn();
+                fmtL->addWidget(m_colorBtn);
+
+                auto* applyColorBtn = mkBtn("A",   "Apply color to selection");
+                auto* stripColorBtn = mkBtn("\xe2\x9c\x95""A", "Remove color from selection");
+
+                fmtL->addSpacing(6);
+
+                // Size dropdown — "─pt─" sentinel resets after applying
+                m_sizeCombo = new QComboBox(m_fmtRow);
+                m_sizeCombo->setFixedWidth(62);
+                m_sizeCombo->setFocusPolicy(Qt::NoFocus);
+                m_sizeCombo->addItems({
+                    "\xe2\x94\x80pt\xe2\x94\x80", // ─pt─
+                    "8","10","12","14","16","18","20","24","28","32"
+                });
+                fmtL->addWidget(m_sizeCombo);
+
+                fmtL->addSpacing(6);
+
+                // Link button — toggles link panel
+                auto* linkBtn = mkBtn("\xf0\x9f\x94\x97", "Insert / edit link");  // 🔗
+
+                fmtL->addSpacing(6);
+
+                // Source/Formatted toggle — shows what clicking it will switch TO
+                m_sourceToggleBtn = new QPushButton("Source", m_fmtRow);
+                m_sourceToggleBtn->setFixedHeight(22);
+                m_sourceToggleBtn->setDefault(false); m_sourceToggleBtn->setAutoDefault(false);
+                m_sourceToggleBtn->setFocusPolicy(Qt::NoFocus);
+                m_sourceToggleBtn->setToolTip("Toggle between formatted preview and raw markdown source");
+                fmtL->addWidget(m_sourceToggleBtn);
+
+                fmtL->addStretch();
+
+                // ── Connections for toolbar buttons ─────────────────────────
+                connect(boldBtn,   &QPushButton::clicked, this, [this]{ ensureSource(); wrapSelection("**",   "**");   });
+                connect(italicBtn, &QPushButton::clicked, this, [this]{ ensureSource(); wrapSelection("*",    "*");    });
+                connect(underBtn,  &QPushButton::clicked, this, [this]{ ensureSource(); wrapSelection("<u>",  "</u>"); });
+
+                connect(m_colorBtn, &QPushButton::clicked, this,
+                    [this]
+                    {
+                        QColor c = QColorDialog::getColor(m_activeColor, this, "Text Color");
+                        if (c.isValid()) { m_activeColor = c; updateColorBtn(); }
+                    });
+                connect(applyColorBtn, &QPushButton::clicked, this,
+                    [this]
+                    {
+                        ensureSource();
+                        wrapSelection(QString("<color=%1>").arg(m_activeColor.name()), "</color>");
+                    });
+                connect(stripColorBtn, &QPushButton::clicked, this, [this]{ ensureSource(); stripTagsFromSelection("color"); });
+
+                connect(m_sizeCombo, QOverload<int>::of(&QComboBox::activated), this,
+                    [this](int idx)
+                    {
+                        if (idx <= 0) return;
+                        const QString pt = m_sizeCombo->itemText(idx);
+                        ensureSource();
+                        wrapSelection(QString("<size=%1>").arg(pt), "</size>");
+                        m_sizeCombo->setCurrentIndex(0);
+                    });
+
+                connect(linkBtn, &QPushButton::clicked, this,
+                    [this]{ m_linkPanel->setVisible(!m_linkPanel->isVisible()); adjustSize(); });
+
+                connect(m_sourceToggleBtn, &QPushButton::clicked, this,
+                    [this]{ setSourceMode(!m_sourceMode); });
+            }
+            vl->addWidget(m_fmtRow);
+
+            // ── Row 3: Content text area ──────────────────────────────────────
             m_valueEdit = new QTextEdit(this);
-            m_valueEdit->setAcceptRichText(false);
-            m_valueEdit->setPlaceholderText("Localised text\xe2\x80\xa6");
-            m_valueEdit->setPlainText(m_originalValue);
-            m_valueEdit->setReadOnly(sourceKey.mode == QLatin1String("Localised"));
-            m_valueEdit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
-            vl->addWidget(m_valueEdit);
+            m_valueEdit->setPlaceholderText("Content\xe2\x80\xa6");
+            m_valueEdit->setMinimumHeight(220);
+            m_valueEdit->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+            m_valueEdit->setStyleSheet(
+                "QTextEdit { background-color: #1e1e1e; color: #e0e0e0; "
+                "border: 1px solid #3a3a3a; border-radius: 2px; }");
+            vl->addWidget(m_valueEdit, 1);
 
-            // Dynamic button row
-            auto* btnRow = new QHBoxLayout();
-            btnRow->addStretch();
-            m_closeBtn  = new QPushButton("Close",  this);
-            m_assignBtn = new QPushButton("Assign", this);
-            m_createBtn = new QPushButton("Create", this);
-            m_updateBtn = new QPushButton("Update", this);
-            m_cancelBtn = new QPushButton("Cancel", this);
-            for (auto* b : {m_closeBtn, m_assignBtn, m_createBtn, m_updateBtn, m_cancelBtn})
+            // ── Row 4: Link panel (collapsed by default) ──────────────────────
+            m_linkPanel = new QWidget(this);
             {
-                b->setAutoDefault(false);
-                b->setDefault(false);
-                btnRow->addWidget(b);
-            }
-            vl->addLayout(btnRow);
+                auto* ll = new QVBoxLayout(m_linkPanel);
+                ll->setContentsMargins(0, 4, 0, 0);
+                ll->setSpacing(3);
 
-            // Toggle value edit readonly when mode changes
+                auto* sepLine = new QFrame(m_linkPanel);
+                sepLine->setFrameShape(QFrame::HLine);
+                sepLine->setFrameShadow(QFrame::Sunken);
+                ll->addWidget(sepLine);
+
+                auto* dispRow = new QHBoxLayout();
+                dispRow->addWidget(new QLabel("Display:", m_linkPanel));
+                m_linkDisplayEdit = new QLineEdit(m_linkPanel);
+                m_linkDisplayEdit->setPlaceholderText("Link text\xe2\x80\xa6");
+                dispRow->addWidget(m_linkDisplayEdit, 1);
+                ll->addLayout(dispRow);
+
+                auto* targetRow = new QHBoxLayout();
+                targetRow->addWidget(new QLabel("Target:", m_linkPanel));
+                m_linkTargetEdit = new QLineEdit(m_linkPanel);
+                m_linkTargetEdit->setPlaceholderText("Ogham://Tag.Path or URL\xe2\x80\xa6");
+                targetRow->addWidget(m_linkTargetEdit, 1);
+
+                auto* targetPickBtn = new QPushButton("\xe2\x96\xbe", m_linkPanel);
+                targetPickBtn->setFixedWidth(26);
+                targetPickBtn->setFocusPolicy(Qt::NoFocus);
+                targetPickBtn->setToolTip("Pick an Ogham entry tag");
+                targetRow->addWidget(targetPickBtn);
+                ll->addLayout(targetRow);
+
+                auto* btnRow = new QHBoxLayout();
+                auto* insertBtn = new QPushButton("Insert Link", m_linkPanel);
+                insertBtn->setDefault(false); insertBtn->setAutoDefault(false);
+                btnRow->addWidget(insertBtn);
+                btnRow->addStretch();
+                ll->addLayout(btnRow);
+
+                connect(insertBtn, &QPushButton::clicked, this, [this]{ insertLink(); });
+                connect(targetPickBtn, &QPushButton::clicked, this,
+                    [this]
+                    {
+                        // Build a menu of all known Ogham entry tags from the known-keys list
+                        QMenu menu(this);
+                        if (m_knownKeys.isEmpty())
+                            menu.addAction("(no tags)")->setEnabled(false);
+                        else
+                            for (const QString& k : m_knownKeys)
+                                connect(menu.addAction(k), &QAction::triggered, this,
+                                    [this, k]{ m_linkTargetEdit->setText("Ogham://" + k); });
+                        menu.exec(m_linkPanel->mapToGlobal(m_linkPanel->rect().bottomLeft()));
+                    });
+            }
+            m_linkPanel->setVisible(false);
+            vl->addWidget(m_linkPanel);
+
+            // ── Row 5: Lexicon key row (Localised only) ───────────────────────
+            m_keyRow = new QWidget(this);
+            {
+                auto* keyL = new QHBoxLayout(m_keyRow);
+                keyL->setContentsMargins(0, 4, 0, 0);
+                keyL->setSpacing(4);
+                keyL->addWidget(new QLabel("Key:", m_keyRow));
+
+                m_keyEdit = new QLineEdit(m_keyRow);
+                m_keyEdit->setPlaceholderText("Localisation key\xe2\x80\xa6");
+                auto* cpl = new QCompleter(knownKeys, m_keyEdit);
+                cpl->setCaseSensitivity(Qt::CaseInsensitive);
+                cpl->setFilterMode(Qt::MatchContains);
+                m_keyEdit->setCompleter(cpl);
+                keyL->addWidget(m_keyEdit, 1);
+
+                auto* keyPickBtn = new QPushButton("\xe2\x96\xbe", m_keyRow);
+                keyPickBtn->setFixedWidth(26);
+                keyPickBtn->setToolTip("Pick an existing localisation key");
+                keyPickBtn->setDefault(false); keyPickBtn->setAutoDefault(false);
+                keyPickBtn->setFocusPolicy(Qt::NoFocus);
+                keyL->addWidget(keyPickBtn);
+
+                connect(keyPickBtn, &QPushButton::clicked, this,
+                    [this, keyPickBtn]
+                    {
+                        QMenu menu(this);
+                        if (m_knownKeys.isEmpty())
+                            menu.addAction("(No keys found)")->setEnabled(false);
+                        else
+                            for (const QString& k : m_knownKeys)
+                                connect(menu.addAction(k), &QAction::triggered, this,
+                                    [this, k]
+                                    {
+                                        m_keyEdit->setText(k);
+                                        const QString val = m_fetchValue(k);
+                                        if (!val.isEmpty()) setEditorText(val);
+                                    });
+                        menu.exec(keyPickBtn->mapToGlobal(keyPickBtn->rect().bottomLeft()));
+                    });
+
+                connect(m_keyEdit, &QLineEdit::returnPressed, this,
+                    [this]
+                    {
+                        const QString val = m_fetchValue(m_keyEdit->text().trimmed());
+                        if (!val.isEmpty()) setEditorText(val);
+                    });
+                m_keyEdit->installEventFilter(this);
+            }
+            vl->addWidget(m_keyRow);
+
+            // ── Populate ──────────────────────────────────────────────────────
+            const bool isLocalised = (sourceKey.mode == QLatin1String("Localised"));
+            if (isLocalised)
+            {
+                m_editKey     = sourceKey.key;
+                m_originalKey = sourceKey.key;
+                const QString fetched = m_fetchValue(sourceKey.key);
+                m_editVal     = fetched.isEmpty() ? sourceKey.key : fetched;
+                m_originalVal = m_editVal;
+                m_keyEdit->setText(m_editKey);
+            }
+            else
+            {
+                m_editKey     = QString();
+                m_originalKey = QString();
+                m_editVal     = sourceKey.key;
+                m_originalVal = m_editVal;
+            }
+
+            // Pre-populate link display from selection (if any text was selected in the graph)
+            if (m_linkDisplayEdit && m_linkDisplayEdit->text().isEmpty())
+                m_linkDisplayEdit->setPlaceholderText("Selected text\xe2\x80\xa6");
+
+            updateKeyRowVisibility();
+            updateFmtRowVisibility();
+
+            // Prime the text edit before setSourceMode reads from it
+            m_valueEdit->setPlainText(m_editVal);
+
+            // Start in Formatted mode (preview) — same default as Unity
+            m_sourceMode = true;   // force setSourceMode to run the switch
+            setSourceMode(false);  // → switches to Formatted (preview)
+
+            // Track text changes in Source mode to keep m_editVal in sync
+            connect(m_valueEdit, &QTextEdit::textChanged, this,
+                [this]
+                {
+                    if (m_sourceMode && !m_suppressSync)
+                        m_editVal = m_valueEdit->toPlainText();
+                });
+
+            // Mode / type change signals
             connect(m_modeCombo, &QComboBox::currentTextChanged, this,
                 [this](const QString& mode)
                 {
-                    const bool localised = (mode == QLatin1String("Localised"));
-                    m_valueEdit->setReadOnly(localised);
-                    if (localised)
-                        m_valueEdit->setPlainText(
-                            m_fetchValue(m_keyCombo->currentText().trimmed()));
+                    if (mode == QLatin1String("Localised"))
+                    {
+                        const QString val = m_fetchValue(m_keyEdit->text().trimmed());
+                        if (!val.isEmpty()) setEditorText(val);
+                    }
+                    updateKeyRowVisibility();
                 });
+            connect(m_typeCombo, &QComboBox::currentTextChanged, this,
+                [this](const QString&){ updateFmtRowVisibility(); });
 
-            // Only update value when user selects from dropdown or confirms with Enter on known key
-            connect(m_keyCombo, QOverload<int>::of(&QComboBox::activated),
-                    this, &LexiconFieldModal::onKeyActivated);
-            connect(m_keyCombo->lineEdit(), &QLineEdit::editingFinished,
-                    this, &LexiconFieldModal::onKeyEditingFinished);
-            connect(m_valueEdit->document(), &QTextDocument::contentsChanged,
-                    this, &LexiconFieldModal::onValueChanged);
-
-            auto makeResult = [this](Action a) -> Result {
-                return { a,
-                         m_keyCombo->currentText().trimmed(),
-                         m_valueEdit->toPlainText(),
-                         m_typeCombo->currentText(),
-                         m_modeCombo->currentText() };
-            };
-            connect(m_closeBtn,  &QPushButton::clicked, this, [this, makeResult]
-            { m_result = makeResult(Action::None);   accept(); });
-            connect(m_assignBtn, &QPushButton::clicked, this, [this, makeResult]
-            { m_result = makeResult(Action::Assign); accept(); });
-            connect(m_createBtn, &QPushButton::clicked, this, [this, makeResult]
-            { m_result = makeResult(Action::Create); accept(); });
-            connect(m_updateBtn, &QPushButton::clicked, this, [this, makeResult]
-            { m_result = makeResult(Action::Update); accept(); });
-            connect(m_cancelBtn, &QPushButton::clicked, this, &QDialog::reject);
-
-            // Size the value edit to 4 lines on first show
-            QTimer::singleShot(0, this, [this]{ setValueHeight(); });
-            updateButtons();
+            adjustSize();
         }
 
-        Result result() const { return m_result; }
+    signals:
+        void committed(OghamLexiconKeyEditPopup::Result result);
 
     protected:
+        void hideEvent(QHideEvent* event) override
+        {
+            // Capture final source text before emitting
+            if (m_sourceMode) m_editVal = m_valueEdit->toPlainText();
+            if (!m_cancelled) emit committed(buildResult());
+            QFrame::hideEvent(event);
+        }
+        void keyPressEvent(QKeyEvent* event) override
+        {
+            if (event->key() == Qt::Key_Escape)
+                { m_cancelled = true; hide(); return; }
+            QFrame::keyPressEvent(event);
+        }
         bool eventFilter(QObject* obj, QEvent* ev) override
         {
-            if (obj == m_keyCombo->lineEdit() && ev->type() == QEvent::KeyPress)
+            if (obj == m_keyEdit && ev->type() == QEvent::KeyPress)
             {
                 const auto* ke = static_cast<QKeyEvent*>(ev);
                 if (ke->key() == Qt::Key_Return || ke->key() == Qt::Key_Enter)
                 {
-                    onKeyEditingFinished();
-                    return true; // consume — don't let it close the dialog
+                    const QString val = m_fetchValue(m_keyEdit->text().trimmed());
+                    if (!val.isEmpty()) setEditorText(val);
+                    return true;
                 }
             }
-            return QDialog::eventFilter(obj, ev);
+            return QFrame::eventFilter(obj, ev);
         }
 
     private:
-        void setValueHeight()
+        // ── Source / Formatted toggle ─────────────────────────────────────────
+        void setSourceMode(bool source)
         {
-            const int lh      = m_valueEdit->fontMetrics().lineSpacing();
-            const int fw      = m_valueEdit->frameWidth();
-            const int overhead = fw * 2 + 8;
-            const int paragraphs = qMax(1, m_valueEdit->toPlainText().count('\n') + 1);
-            const int target   = lh * qBound(1, paragraphs, 4) + overhead;
-            // Enforce at least 4-line height as the initial size
-            const int initial  = lh * 4 + overhead;
-            m_valueEdit->setFixedHeight(qMax(target, initial));
+            if (m_sourceMode == source) return;
+
+            if (m_sourceMode && !m_suppressSync)
+                m_editVal = m_valueEdit->toPlainText();   // save before switching away
+
+            m_sourceMode = source;
+
+            if (source)
+            {
+                // Source: editable plain-text markdown
+                m_suppressSync = true;
+                m_valueEdit->setAcceptRichText(false);
+                m_valueEdit->setReadOnly(false);
+                m_valueEdit->setPlainText(m_editVal);
+                m_suppressSync = false;
+                if (m_sourceToggleBtn) m_sourceToggleBtn->setText("Formatted");
+            }
+            else
+            {
+                // Formatted: rendered HTML preview (read-only)
+                m_valueEdit->setReadOnly(true);
+                m_valueEdit->setHtml(oghamToHtml(m_editVal));
+                if (m_sourceToggleBtn) m_sourceToggleBtn->setText("Source");
+            }
+        }
+
+        void ensureSource()
+        {
+            if (!m_sourceMode) setSourceMode(true);
+        }
+
+        void setEditorText(const QString& text)
+        {
+            m_editVal = text;
+            m_suppressSync = true;
+            if (m_sourceMode)
+                m_valueEdit->setPlainText(text);
+            else
+                m_valueEdit->setHtml(oghamToHtml(text));
+            m_suppressSync = false;
+        }
+
+        // ── Helpers ───────────────────────────────────────────────────────────
+        void updateColorBtn()
+        {
+            if (!m_colorBtn) return;
+            const QString hex = m_activeColor.name();
+            // Invert text colour for readability on the swatch
+            const bool dark = (m_activeColor.red()*299 + m_activeColor.green()*587
+                                + m_activeColor.blue()*114) < 128000;
+            m_colorBtn->setStyleSheet(
+                QString("QPushButton { background-color: %1; color: %2; }")
+                .arg(hex, dark ? "#ffffff" : "#000000"));
+        }
+
+        void updateKeyRowVisibility()
+        {
+            if (m_keyRow) m_keyRow->setVisible(
+                m_modeCombo && m_modeCombo->currentText() == QLatin1String("Localised"));
             adjustSize();
         }
 
-        void onKeyActivated(int /*index*/)
+        void updateFmtRowVisibility()
         {
-            const QString val = m_fetchValue(m_keyCombo->currentText().trimmed());
-            m_suppressValueSignal = true;
-            m_valueEdit->setPlainText(val);
-            m_suppressValueSignal = false;
-            setValueHeight();
-            updateButtons();
+            if (m_fmtRow) m_fmtRow->setVisible(
+                m_typeCombo && m_typeCombo->currentText() == QLatin1String("Text"));
+            adjustSize();
         }
 
-        void onKeyEditingFinished()
+        void wrapSelection(const QString& open, const QString& close)
         {
-            const QString key = m_keyCombo->currentText().trimmed();
-            const QString val = m_fetchValue(key);
-            if (!val.isEmpty())
+            QTextCursor cur = m_valueEdit->textCursor();
+            const QString sel = cur.selectedText();
+            cur.insertText(open + sel + close);
+            if (sel.isEmpty())
+                cur.movePosition(QTextCursor::Left, QTextCursor::MoveAnchor, close.length());
+            m_valueEdit->setTextCursor(cur);
+            m_valueEdit->setFocus();
+        }
+
+        void stripTagsFromSelection(const QString& tagName)
+        {
+            QTextCursor cur = m_valueEdit->textCursor();
+            const QString sel = cur.selectedText();
+            if (sel.isEmpty()) return;
+            // Remove <tagName=...>...</tagName> or <tagName>...</tagName>
+            QString stripped = sel;
+            QRegularExpression rx(
+                QString(R"(<\s*%1[^>]*>(.*?)<\s*/%1\s*>)").arg(QRegularExpression::escape(tagName)),
+                QRegularExpression::DotMatchesEverythingOption | QRegularExpression::CaseInsensitiveOption);
+            stripped.replace(rx, "\\1");
+            cur.insertText(stripped);
+            m_valueEdit->setFocus();
+        }
+
+        void insertLink()
+        {
+            ensureSource();
+            const QString display = m_linkDisplayEdit ? m_linkDisplayEdit->text() : QString{};
+            const QString target  = m_linkTargetEdit  ? m_linkTargetEdit->text()  : QString{};
+            if (target.isEmpty()) return;
+
+            QTextCursor cur = m_valueEdit->textCursor();
+            const QString sel = cur.selectedText();
+            const QString disp = display.isEmpty() ? (sel.isEmpty() ? "link" : sel) : display;
+            cur.insertText(QString("[%1](%2)").arg(disp, target));
+            m_valueEdit->setFocus();
+            if (m_linkPanel) { m_linkPanel->setVisible(false); adjustSize(); }
+        }
+
+        Result buildResult() const
+        {
+            const QString mode = m_modeCombo ? m_modeCombo->currentText() : "Literal";
+            const QString type = m_typeCombo ? m_typeCombo->currentText() : "Text";
+
+            if (mode == QLatin1String("Localised"))
             {
-                m_suppressValueSignal = true;
-                m_valueEdit->setPlainText(val);
-                m_suppressValueSignal = false;
-                setValueHeight();
+                const QString key = m_keyEdit ? m_keyEdit->text().trimmed() : QString{};
+                const bool textChanged = (m_editVal != m_originalVal);
+                const bool keyChanged  = (key       != m_originalKey);
+                const LexiconWrite lw  = (textChanged || (keyChanged && !key.isEmpty()))
+                                         ? LexiconWrite::Write : LexiconWrite::None;
+                return { lw, key, m_editVal, type, mode };
             }
-            updateButtons();
+            // Literal / Invariant: the text IS the disk key
+            return { LexiconWrite::None, m_editVal, QString(), type, mode };
         }
 
-        void onValueChanged()
-        {
-            if (m_suppressValueSignal) return;
-            setValueHeight();
-            updateButtons();
-        }
+        bool        m_cancelled    = false;
+        bool        m_sourceMode   = true;
+        bool        m_suppressSync = false;
+        QColor      m_activeColor  = Qt::white;
+        QString     m_editKey;
+        QString     m_editVal;
+        QString     m_originalKey;
+        QString     m_originalVal;
+        QStringList m_knownKeys;
+        FetchValFn  m_fetchValue;
 
-        void updateButtons()
-        {
-            const QString curKey = m_keyCombo->currentText().trimmed();
-            const QString curVal = m_valueEdit->toPlainText();
-            const bool keyChanged   = (curKey != m_originalKey);
-            const bool valueChanged = (!keyChanged && curVal != m_originalValue);
-            const bool keyInLexicon = (!curKey.isEmpty() && !m_fetchValue(curKey).isEmpty());
-
-            const bool showClose  = !keyChanged && !valueChanged;
-            const bool showAssign = keyChanged  && keyInLexicon;
-            const bool showCreate = keyChanged  && !keyInLexicon;
-            const bool showUpdate = valueChanged;
-
-            m_closeBtn ->setVisible(showClose);
-            m_assignBtn->setVisible(showAssign);
-            m_createBtn->setVisible(showCreate);
-            m_updateBtn->setVisible(showUpdate);
-            m_cancelBtn->setVisible(!showClose);
-        }
-
-        QString   m_originalKey;
-        QString   m_originalValue;
-        bool      m_suppressValueSignal = false;
-        Result    m_result;
-        std::function<QString(const QString&)> m_fetchValue;
-
-        QComboBox*   m_typeCombo = nullptr;
-        QComboBox*   m_modeCombo = nullptr;
-        QComboBox*   m_keyCombo  = nullptr;
-        QTextEdit*   m_valueEdit = nullptr;
-        QPushButton* m_closeBtn  = nullptr;
-        QPushButton* m_assignBtn = nullptr;
-        QPushButton* m_createBtn = nullptr;
-        QPushButton* m_updateBtn = nullptr;
-        QPushButton* m_cancelBtn = nullptr;
+        QComboBox*   m_typeCombo        = nullptr;
+        QComboBox*   m_modeCombo        = nullptr;
+        QTextEdit*   m_valueEdit        = nullptr;
+        QLineEdit*   m_keyEdit          = nullptr;
+        QWidget*     m_keyRow           = nullptr;
+        QWidget*     m_fmtRow           = nullptr;
+        QWidget*     m_linkPanel        = nullptr;
+        QLineEdit*   m_linkDisplayEdit  = nullptr;
+        QLineEdit*   m_linkTargetEdit   = nullptr;
+        QPushButton* m_colorBtn         = nullptr;
+        QPushButton* m_sourceToggleBtn  = nullptr;
+        QComboBox*   m_sizeCombo        = nullptr;
     };
 
     // =========================================================================
-    // OperationEditorModal — edit one OghamOperation
+    // OghamOperationEditPopup — non-modal frameless popup for editing one OghamOperation.
+    // Commits on Enter or close; cancels on Escape. Auto-deletes on close.
     // =========================================================================
 
-    class OperationEditorModal : public QDialog
+    class OghamOperationEditPopup : public QFrame
     {
+        Q_OBJECT
         using AddTagFn = std::function<void(const QString&, QToolButton*)>;
     public:
-        OperationEditorModal(const OghamOperation& op,
-                             const QStringList&    knownTags,
-                             AddTagFn              addTagFn,
-                             QWidget*              parent = nullptr)
-            : QDialog(parent, Qt::Dialog | Qt::FramelessWindowHint)
+        OghamOperationEditPopup(const OghamOperation& op,
+                                const QStringList&    knownTags,
+                                AddTagFn              addTagFn,
+                                QWidget*              parent = nullptr)
+            : QFrame(parent, Qt::Popup | Qt::FramelessWindowHint)
             , m_op(op)
             , m_knownTags(knownTags)
             , m_addTagFn(std::move(addTagFn))
         {
-            setWindowTitle("Edit Operation");
+            setAttribute(Qt::WA_DeleteOnClose);
+            setFrameShape(QFrame::StyledPanel);
             setMinimumWidth(460);
             auto* vl = new QVBoxLayout(this);
             vl->setSpacing(8);
@@ -543,6 +896,8 @@ namespace FoundationOgham
             auto* condScroll = new QScrollArea(this);
             condScroll->setWidgetResizable(true);
             condScroll->setMaximumHeight(180);
+            condScroll->setFrameShape(QFrame::NoFrame);
+            condScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
             m_condArea   = new QWidget(this);
             m_condLayout = new QVBoxLayout(m_condArea);
             m_condLayout->setContentsMargins(0,0,0,0);
@@ -556,19 +911,30 @@ namespace FoundationOgham
                 rebuildConditions();
             });
             rebuildConditions();
-
-            auto* btns = new QDialogButtonBox(
-                QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
-            if (auto* ok = btns->button(QDialogButtonBox::Ok))
-                { ok->setAutoDefault(false); ok->setDefault(false); }
-            vl->addWidget(btns);
-            connect(btns, &QDialogButtonBox::accepted, this, &QDialog::accept);
-            connect(btns, &QDialogButtonBox::rejected, this, &QDialog::reject);
         }
 
-        OghamOperation result() const { return m_op; }
+    signals:
+        void committed(OghamOperation op);
+
+    protected:
+        void hideEvent(QHideEvent* event) override
+        {
+            if (!m_cancelled)
+                emit committed(m_op);
+            QFrame::hideEvent(event);
+        }
+        void keyPressEvent(QKeyEvent* event) override
+        {
+            if (event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter)
+                { hide(); return; }
+            if (event->key() == Qt::Key_Escape)
+                { m_cancelled = true; hide(); return; }
+            QFrame::keyPressEvent(event);
+        }
 
     private:
+        bool m_cancelled = false;
+
         void refreshTagStatusConn()
         {
             m_tagStatus->disconnect();
@@ -1265,30 +1631,27 @@ namespace FoundationOgham
         setWindowTitle("Ogham Storyteller");
 
         // ── Toolbar ─────────────────────────────────────────────────────────
+        // Left group: [Support][Docs][Save .ogmcon][Snap]
+        // Right group: [Layout][▶ Play][Import]
         auto* toolbar  = new QWidget(this);
         auto* tbLayout = new QHBoxLayout(toolbar);
         tbLayout->setContentsMargins(4, 4, 4, 4);
         tbLayout->setSpacing(6);
 
-        m_newFileBtn = new QPushButton("New File...", toolbar);
-        tbLayout->addWidget(m_newFileBtn);
+        m_supportBtn = new QPushButton("Support", toolbar);
+        m_supportBtn->setToolTip("Open Heathen Discord support channel");
+        tbLayout->addWidget(m_supportBtn);
+
+        m_docsBtn = new QPushButton("Docs", toolbar);
+        m_docsBtn->setToolTip("Open Ogham Storyteller documentation");
+        tbLayout->addWidget(m_docsBtn);
 
         tbLayout->addSpacing(8);
 
-        m_saveAllBtn = new QPushButton("Save All", toolbar);
+        m_saveAllBtn = new QPushButton("Save .ogmcon", toolbar);
         m_saveAllBtn->setEnabled(false);
+        m_saveAllBtn->setToolTip("Save all modified conversation files");
         tbLayout->addWidget(m_saveAllBtn);
-
-        m_openSrcBtn = new QPushButton("Open Source...", toolbar);
-        tbLayout->addWidget(m_openSrcBtn);
-
-        tbLayout->addSpacing(16);
-
-        m_layoutBtn = new QPushButton("Layout", toolbar);
-        m_layoutBtn->setToolTip("Auto-arrange all visible nodes (BFS tree layout)");
-        tbLayout->addWidget(m_layoutBtn);
-
-        tbLayout->addSpacing(8);
 
         m_snapBtn = new QPushButton("\xe2\x8a\x9e Snap", toolbar);
         m_snapBtn->setCheckable(true);
@@ -1296,10 +1659,15 @@ namespace FoundationOgham
         m_snapBtn->setToolTip("Snap node positions to 20px grid");
         tbLayout->addWidget(m_snapBtn);
 
-        tbLayout->addSpacing(8);
+        tbLayout->addStretch();
 
-        m_playFromNodeBtn = new QPushButton("\xe2\x96\xb6 Play from Node", toolbar);
+        m_layoutBtn = new QPushButton("Layout", toolbar);
+        m_layoutBtn->setToolTip("Auto-arrange all visible nodes (BFS tree layout)");
+        tbLayout->addWidget(m_layoutBtn);
+
+        m_playFromNodeBtn = new QPushButton("\xe2\x96\xb6 Play", toolbar);
         m_playFromNodeBtn->setEnabled(false);
+        m_playFromNodeBtn->setToolTip("Play from selected node");
         m_playFromNodeBtn->setStyleSheet(
             "QPushButton { background-color: #2a5c2a; color: white; "
             "font-weight: bold; padding: 5px; border-radius: 3px; }"
@@ -1307,25 +1675,9 @@ namespace FoundationOgham
             "QPushButton:disabled { background-color: #333333; color: #666666; }");
         tbLayout->addWidget(m_playFromNodeBtn);
 
-        {
-            auto* alignBtn  = new QPushButton("Align \xe2\x96\xbe", toolbar);
-            auto* alignMenu = new QMenu(toolbar);
-            alignMenu->addAction("Align Left",   [this]{ AlignSelected(0); });
-            alignMenu->addAction("Align Right",  [this]{ AlignSelected(1); });
-            alignMenu->addAction("Center H",     [this]{ AlignSelected(2); });
-            alignMenu->addSeparator();
-            alignMenu->addAction("Align Top",    [this]{ AlignSelected(3); });
-            alignMenu->addAction("Align Bottom", [this]{ AlignSelected(4); });
-            alignMenu->addAction("Center V",     [this]{ AlignSelected(5); });
-            alignMenu->addSeparator();
-            alignMenu->addAction("Distribute H", [this]{ AlignSelected(6); });
-            alignMenu->addAction("Distribute V", [this]{ AlignSelected(7); });
-            alignBtn->setMenu(alignMenu);
-            alignBtn->setToolTip("Align or distribute selected nodes");
-            tbLayout->addWidget(alignBtn);
-        }
-
-        tbLayout->addStretch();
+        m_importBtn = new QPushButton("Import", toolbar);
+        m_importBtn->setToolTip("Open Twee/Twine importer (requires Ogham Toolkit)");
+        tbLayout->addWidget(m_importBtn);
 
         // ── Left: 2-column entry tree ────────────────────────────────────────
         m_tree = new QTreeWidget(this);
@@ -1333,7 +1685,7 @@ namespace FoundationOgham
         m_tree->setHeaderHidden(true);
         m_tree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
         m_tree->header()->setSectionResizeMode(1, QHeaderView::Fixed);
-        m_tree->setColumnWidth(1, 100);
+        m_tree->setColumnWidth(1, 28);
         m_tree->setMinimumWidth(150);
         m_tree->setContextMenuPolicy(Qt::CustomContextMenu);
 
@@ -1376,13 +1728,14 @@ namespace FoundationOgham
         mainLayout->addWidget(m_statusLabel);
 
         // ── Connections ──────────────────────────────────────────────────────
-        connect(m_newFileBtn,  &QPushButton::clicked, this, &OghamStoryteller::OnNewFile);
-        connect(m_saveAllBtn,  &QPushButton::clicked, this, &OghamStoryteller::OnSaveAll);
-        connect(m_openSrcBtn,  &QPushButton::clicked, this, &OghamStoryteller::OnOpenSource);
-        connect(m_layoutBtn,   &QPushButton::clicked, this, &OghamStoryteller::OnLayoutGraph);
-        connect(m_snapBtn,     &QPushButton::toggled,  this, &OghamStoryteller::OnSnapToggle);
-        connect(m_treeSearch,  &QLineEdit::textChanged, this, &OghamStoryteller::OnTreeSearch);
+        connect(m_supportBtn,      &QPushButton::clicked, this, &OghamStoryteller::OnSupport);
+        connect(m_docsBtn,         &QPushButton::clicked, this, &OghamStoryteller::OnDocs);
+        connect(m_saveAllBtn,      &QPushButton::clicked, this, &OghamStoryteller::OnSaveAll);
+        connect(m_snapBtn,         &QPushButton::toggled,  this, &OghamStoryteller::OnSnapToggle);
+        connect(m_layoutBtn,       &QPushButton::clicked, this, &OghamStoryteller::OnLayoutGraph);
         connect(m_playFromNodeBtn, &QPushButton::clicked, this, &OghamStoryteller::OnPlayFromNode);
+        connect(m_importBtn,       &QPushButton::clicked, this, &OghamStoryteller::OnImport);
+        connect(m_treeSearch,      &QLineEdit::textChanged, this, &OghamStoryteller::OnTreeSearch);
 
         connect(m_tree, &QTreeWidget::currentItemChanged,
             [this](QTreeWidgetItem* current, QTreeWidgetItem*)
@@ -1465,20 +1818,54 @@ namespace FoundationOgham
             [this](const QPoint& pos)
             {
                 QTreeWidgetItem* item = m_tree->itemAt(pos);
-                if (!item) return;
+                QMenu menu(this);
+
+                if (!item)
+                {
+                    // Background click — file-level operations
+                    menu.addAction("New File\xe2\x80\xa6", [this]{ OnNewFile(); });
+                    menu.exec(m_tree->viewport()->mapToGlobal(pos));
+                    return;
+                }
+
                 const int fi = item->data(0, kRoleFileIdx).toInt();
                 const int ei = item->data(0, kRoleEntryIdx).toInt();
-                if (fi < 0 || ei < 0 || m_loadedFiles.size() <= 1) return;
 
-                QMenu menu(this);
-                QMenu* moveMenu = menu.addMenu("Move to file\xe2\x80\xa6");
-                for (int dfi = 0; dfi < m_loadedFiles.size(); ++dfi)
+                if (fi >= 0 && ei < 0)
                 {
-                    if (dfi == fi) continue;
-                    const QString label = QFileInfo(m_loadedFiles[dfi].path).fileName();
-                    QAction* act = moveMenu->addAction(label);
-                    connect(act, &QAction::triggered,
-                        [this, fi, ei, dfi]() { MoveEntryToFile(fi, ei, dfi); });
+                    // File header row
+                    menu.addAction("Add Entry", [this, fi]{ AddRootEntry(fi); });
+                    menu.addSeparator();
+                    menu.addAction("Open Source File", [this, fi]{
+                        if (fi >= 0 && fi < m_loadedFiles.size())
+                            QDesktopServices::openUrl(QUrl::fromLocalFile(m_loadedFiles[fi].path));
+                    });
+                }
+                else if (fi >= 0 && ei >= 0)
+                {
+                    // Entry row
+                    const QString nodeTag = item->data(0, kRoleNodeTag).toString();
+                    const bool isReal = !nodeTag.isEmpty();
+                    menu.addAction("Add Sibling", [this, fi, nodeTag]{ AddSiblingEntry(fi, nodeTag); });
+                    menu.addAction("Add Child",   [this, fi, nodeTag]{ AddChildEntry(fi, nodeTag); });
+                    if (isReal)
+                    {
+                        menu.addSeparator();
+                        menu.addAction("Remove Entry", [this, fi, ei]{ RemoveEntry(fi, ei); });
+                    }
+                    if (m_loadedFiles.size() > 1)
+                    {
+                        menu.addSeparator();
+                        QMenu* moveMenu = menu.addMenu("Move to file\xe2\x80\xa6");
+                        for (int dfi = 0; dfi < m_loadedFiles.size(); ++dfi)
+                        {
+                            if (dfi == fi) continue;
+                            const QString label = QFileInfo(m_loadedFiles[dfi].path).fileName();
+                            QAction* act = moveMenu->addAction(label);
+                            connect(act, &QAction::triggered,
+                                [this, fi, ei, dfi]() { MoveEntryToFile(fi, ei, dfi); });
+                        }
+                    }
                 }
                 menu.exec(m_tree->viewport()->mapToGlobal(pos));
             });
@@ -1539,6 +1926,25 @@ namespace FoundationOgham
     // -------------------------------------------------------------------------
     // Toolbar slots
     // -------------------------------------------------------------------------
+
+    void OghamStoryteller::OnSupport()
+    {
+        QDesktopServices::openUrl(QUrl("https://discord.gg/UsNkQWEyww"));
+    }
+
+    void OghamStoryteller::OnDocs()
+    {
+        QDesktopServices::openUrl(QUrl("https://heathen.group/kb/ogham-welcome/"));
+    }
+
+    void OghamStoryteller::OnImport()
+    {
+        // Requires the Ogham Storyteller Toolkit (sponsor gem).
+        // The toolkit registers an import handler via EBus; if none is present, inform the user.
+        QMessageBox::information(this, "Ogham Importer",
+            "The Twee/Twine importer requires the Ogham Storyteller Toolkit.\n\n"
+            "Available to GitHub Sponsors at heathen.group/kb/do-more/");
+    }
 
     void OghamStoryteller::OnNewFile()
     {
@@ -2493,45 +2899,39 @@ namespace FoundationOgham
         if (fi < 0 || fi >= m_loadedFiles.size()) return;
         auto& entries = m_loadedFiles[fi].entries;
         if (ei < 0 || ei >= entries.size()) return;
-        auto& entry = entries[ei];
-        if (rowIdx < 0 || rowIdx >= entry.dataKeys.size()) return;
+        if (rowIdx < 0 || rowIdx >= entries[ei].dataKeys.size()) return;
 
-        const OghamSourceKey currentSk = entry.dataKeys[rowIdx];
-        const QStringList known  = FetchKnownLexiconKeys();
+        const OghamSourceKey currentSk = entries[ei].dataKeys[rowIdx];
+        const QStringList    known     = FetchKnownLexiconKeys();
         auto fetchVal = [this](const QString& k){ return FetchLexiconValueForKey(k); };
 
-        LexiconFieldModal dlg(currentSk, known, fetchVal, this);
-        dlg.adjustSize();
-        dlg.move(ModalPos(screenPos, dlg));
+        // Qt::Popup closes any previous popup automatically.
+        auto* popup = new OghamLexiconKeyEditPopup(currentSk, known, fetchVal);
 
-        if (dlg.exec() != QDialog::Accepted) return;
+        connect(popup, &OghamLexiconKeyEditPopup::committed, this,
+            [this, fi, ei, rowIdx](const OghamLexiconKeyEditPopup::Result& res)
+            {
+                if (fi >= m_loadedFiles.size()) return;
+                auto& ents = m_loadedFiles[fi].entries;
+                if (ei >= ents.size() || rowIdx >= ents[ei].dataKeys.size()) return;
 
-        const LexiconFieldModal::Result res = dlg.result();
-        if (res.action == LexiconFieldModal::Action::None) return;
+                // Always update the data model
+                ents[ei].dataKeys[rowIdx] = OghamSourceKey{ res.type, res.mode, res.diskKey };
+                SetFileDirty(fi, true);
 
-        // Update the data model for Assign/Create/Update
-        if (res.action != LexiconFieldModal::Action::Update)
-        {
-            entry.dataKeys[rowIdx] = OghamSourceKey{ res.type, res.mode, res.key };
-            SetFileDirty(fi, true);
-        }
-        else
-        {
-            // Update action: preserve key but allow type/mode changes
-            entry.dataKeys[rowIdx].type = res.type;
-            entry.dataKeys[rowIdx].mode = res.mode;
-            SetFileDirty(fi, true);
-        }
+                // Write to lexicon only if the popup determined it's needed
+                if (res.lexiconWrite == OghamLexiconKeyEditPopup::LexiconWrite::Write
+                        && !res.diskKey.isEmpty())
+                    WriteLexiconEntry(res.diskKey, res.lexValue);
 
-        // Write to the lexicon when the value changes (Create or Update)
-        if (res.action == LexiconFieldModal::Action::Create ||
-            res.action == LexiconFieldModal::Action::Update)
-        {
-            if (!res.key.isEmpty())
-                WriteLexiconEntry(res.key, res.value);
-        }
+                RebuildGraph();
+            });
 
-        RebuildGraph();
+        popup->adjustSize();
+        popup->move(screenPos);
+        popup->show();
+        popup->raise();
+        popup->activateWindow();
     }
 
     void OghamStoryteller::AddDataKey(int fi, int ei, QPoint screenPos)
@@ -2585,14 +2985,26 @@ namespace FoundationOgham
         auto addTagFn = [this](const QString& tag, QToolButton* btn)
         { ShowAddTagDialog(tag, btn); };
 
-        OperationEditorModal dlg(entOps[row], FetchAllTagsFromAllFiles(), addTagFn, this);
-        dlg.adjustSize();
-        dlg.move(ModalPos(screenPos, dlg));
-        if (dlg.exec() != QDialog::Accepted) return;
+        // Qt::Popup closes any previous popup automatically when a new one opens.
+        auto* popup = new OghamOperationEditPopup(
+            entOps[row], FetchAllTagsFromAllFiles(), addTagFn);
 
-        entOps[row] = dlg.result();
-        SetFileDirty(fi, true);
-        RebuildGraph();
+        connect(popup, &OghamOperationEditPopup::committed, this,
+            [this, fi, ei, row](const OghamOperation& result)
+            {
+                if (fi >= m_loadedFiles.size()) return;
+                auto& ents = m_loadedFiles[fi].entries;
+                if (ei >= ents.size() || row >= ents[ei].entryOperations.size()) return;
+                ents[ei].entryOperations[row] = result;
+                SetFileDirty(fi, true);
+                RebuildGraph();
+            });
+
+        popup->adjustSize();
+        popup->move(screenPos);
+        popup->show();
+        popup->raise();
+        popup->activateWindow();
     }
 
     void OghamStoryteller::AddEntryOperation(int fi, int ei, QPoint screenPos)
@@ -2889,28 +3301,15 @@ namespace FoundationOgham
         auto* w  = new QWidget();
         auto* hl = new QHBoxLayout(w);
         hl->setContentsMargins(2, 1, 2, 1);
-        hl->setSpacing(2);
+        hl->setSpacing(0);
 
-        // Stretch first so buttons sit on the right edge of the column
-        hl->addStretch();
-
-        // Eye toggle — show/hide this file's nodes in the graph
+        // Eye toggle only — show/hide this file's nodes in the graph
         const bool initVis = (fileIdx < m_loadedFiles.size()) && m_loadedFiles[fileIdx].visible;
         auto* eyeBtn = new QPushButton(initVis ? "\xe2\x97\x8f" : "\xe2\x97\x8b", w);  // ● / ○
         eyeBtn->setFixedSize(22, 22);
         eyeBtn->setStyleSheet(initVis ? "color: #6ab0d0;" : "color: #555555;");
         eyeBtn->setToolTip(initVis ? "Hide nodes in graph" : "Show nodes in graph");
         hl->addWidget(eyeBtn);
-
-        auto* addRoot = new QPushButton("+", w);
-        addRoot->setFixedSize(22, 22);
-        addRoot->setToolTip("Add root entry to this file");
-        hl->addWidget(addRoot);
-
-        auto* openBtn = new QPushButton("\xe2\x80\xa6", w);  // …
-        openBtn->setFixedSize(22, 22);
-        openBtn->setToolTip("Open source file");
-        hl->addWidget(openBtn);
 
         connect(eyeBtn, &QPushButton::clicked,
             [this, fileIdx, eyeBtn]()
@@ -2923,63 +3322,13 @@ namespace FoundationOgham
                 eyeBtn->setToolTip(v ? "Hide nodes in graph" : "Show nodes in graph");
                 ApplyGraphVisibility();
             });
-        connect(addRoot, &QPushButton::clicked,
-            [this, fileIdx]() { AddRootEntry(fileIdx); });
-        connect(openBtn, &QPushButton::clicked,
-            [this, fileIdx]()
-            {
-                if (fileIdx >= 0 && fileIdx < m_loadedFiles.size())
-                    QDesktopServices::openUrl(
-                        QUrl::fromLocalFile(m_loadedFiles[fileIdx].path));
-            });
         return w;
     }
 
-    QWidget* OghamStoryteller::MakeEntryButtons(int fileIdx, int entryIdx,
-                                                  bool isReal, const QString& nodeTag)
+    QWidget* OghamStoryteller::MakeEntryButtons(int /*fileIdx*/, int /*entryIdx*/,
+                                                  bool /*isReal*/, const QString& /*nodeTag*/)
     {
-        auto* w  = new QWidget();
-        auto* hl = new QHBoxLayout(w);
-        hl->setContentsMargins(2, 1, 2, 1);
-        hl->setSpacing(2);
-
-        // Stretch first so buttons sit on the right edge of the column
-        hl->addStretch();
-
-        auto* addSibling = new QPushButton("+", w);
-        addSibling->setFixedSize(22, 22);
-        addSibling->setToolTip("Add sibling entry");
-        hl->addWidget(addSibling);
-
-        auto* addChild = new QPushButton("\xe2\x86\x93", w);  // ↓
-        addChild->setFixedSize(22, 22);
-        addChild->setToolTip("Add child entry");
-        hl->addWidget(addChild);
-
-        if (isReal)
-        {
-            auto* removeBtn = new QPushButton("X", w);
-            removeBtn->setFixedSize(22, 22);
-            removeBtn->setToolTip("Remove this entry (children remain)");
-            removeBtn->setStyleSheet("color: #cc3333; font-weight: bold;");
-            hl->addWidget(removeBtn);
-            connect(removeBtn, &QPushButton::clicked,
-                [this, fileIdx, entryIdx]() { RemoveEntry(fileIdx, entryIdx); });
-        }
-        else
-        {
-            // Keep column width uniform
-            auto* spacer = new QWidget(w);
-            spacer->setFixedSize(22, 22);
-            hl->addWidget(spacer);
-        }
-
-        connect(addSibling, &QPushButton::clicked,
-            [this, fileIdx, nodeTag]() { AddSiblingEntry(fileIdx, nodeTag); });
-        connect(addChild, &QPushButton::clicked,
-            [this, fileIdx, nodeTag]() { AddChildEntry(fileIdx, nodeTag); });
-
-        return w;
+        return nullptr;  // all entry-level operations are via right-click context menu
     }
 
     void OghamStoryteller::RebuildTree()
@@ -4770,4 +5119,5 @@ namespace FoundationOgham
 
 } // namespace FoundationOgham
 
+#include "OghamStoryteller.moc"
 #include <moc_OghamStoryteller.cpp>

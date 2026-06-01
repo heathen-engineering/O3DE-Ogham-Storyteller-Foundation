@@ -115,9 +115,10 @@ namespace FoundationOgham
         int                      m_draggingIdx = -1;
         int                      m_hoverIdx    = -1;
 
-        // Tab mode state
+        // Tab / self-ref mode state
         QString m_targetTag;
         bool    m_displayAsTab = false;
+        bool    m_isSelfRef    = false;
         bool    m_tabHovered   = false;
         qreal   m_savedZValue  = 0.0;
         QPointF m_tabPos;

@@ -220,7 +220,7 @@ namespace FoundationOgham
 
             emit pinDragEnded();
 
-            if (dstNode && dstNode != src)
+            if (dstNode)
                 emit pinDroppedOnNode(src, opt, dstNode);
             else if (dstAlias)
                 emit pinDroppedOnAlias(src, opt, dstAlias);

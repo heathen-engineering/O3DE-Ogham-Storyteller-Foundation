@@ -102,7 +102,8 @@ namespace FoundationOgham
         if (!m_srcNode || !m_srcNode->scene()) return;
         prepareGeometryChange();
         const QPointF src = m_srcNode->outputPinScenePos(m_optionIdx);
-        if (m_displayAsTab)
+        m_isSelfRef = !m_targetTag.isEmpty() && (m_srcNode->tag() == m_targetTag);
+        if (m_displayAsTab || m_isSelfRef)
         {
             m_tabPos = src;
         }
@@ -129,6 +130,8 @@ namespace FoundationOgham
 
     QRectF OghamConnectionItem::boundingRect() const
     {
+        if (m_isSelfRef)
+            return QRectF(m_tabPos.x() - 1.0, m_tabPos.y() - 13.0, 28.0, 26.0);
         if (m_displayAsTab)
         {
             const qreal maxW = kTabHoverW + kTabArrow;
@@ -142,6 +145,12 @@ namespace FoundationOgham
 
     QPainterPath OghamConnectionItem::shape() const
     {
+        if (m_isSelfRef)
+        {
+            QPainterPath p;
+            p.addRect(QRectF(m_tabPos.x(), m_tabPos.y() - 12.0, 26.0, 24.0));
+            return p;
+        }
         if (m_displayAsTab)
         {
             QPainterPath p;
@@ -158,6 +167,20 @@ namespace FoundationOgham
                                     QWidget*                        /*widget*/)
     {
         painter->setRenderHint(QPainter::Antialiasing);
+
+        if (m_isSelfRef)
+        {
+            // Self-referencing option: draw a loop/refresh icon (↻) at the output pin
+            QFont f = painter->font();
+            f.setPointSizeF(14.0);
+            painter->setFont(f);
+            painter->setPen(QPen(kColLine.lighter(150), 1.5));
+            painter->drawText(
+                QRectF(m_tabPos.x() + 2.0, m_tabPos.y() - 12.0, 24.0, 24.0),
+                Qt::AlignCenter,
+                QString(QChar(0x21BB)));  // ↻ CLOCKWISE OPEN CIRCLE ARROW
+            return;
+        }
 
         if (m_displayAsTab)
         {
