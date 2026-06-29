@@ -53,7 +53,6 @@ ly_add_target(
             AZ::AzFramework
             Gem::FoundationGameplayTags.API
             Gem::xxHash.API
-            Gem::FoundationHeathenWidgets.API
             Gem::FoundationLocalisation.API
 )
 
