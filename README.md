@@ -16,7 +16,7 @@ An [Open 3D Engine (O3DE)](https://o3de.org) gem providing a data-driven narrati
 -----
 
 ## 🛠 Also Available For
-[![Unity](https://img.shields.io/badge/Unity-6%20%2B-black?style=for-the-badge&logo=unity&logoColor=white)](https://github.com/heathen-engineering/Unity-Ogham-Storyteller-Foundation)
+[![Unity](https://img.shields.io/badge/Unity-6%20%2B-%23313131?style=for-the-badge&logo=unity&logoColor=white)](https://github.com/heathen-engineering/Unity-Ogham-Storyteller-Foundation)
 
 ----
 
