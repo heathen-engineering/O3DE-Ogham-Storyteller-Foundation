@@ -1,3 +1,5 @@
+> **Migrating to Codeberg:** this repo is moving to [codeberg.org/Heathen-Engineering/O3DE-Ogham-Storytelling-Foundation](https://codeberg.org/Heathen-Engineering/O3DE-Ogham-Storytelling-Foundation). GitHub will remain a read-only mirror during the transition.
+
 # Ogham Storyteller Foundaiton Gem
 ![License](https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square)
 ![Maintained](https://img.shields.io/badge/Maintained%3F-yes-green?style=flat-square)
