@@ -36,12 +36,15 @@ An [Open 3D Engine (O3DE)](https://o3de.org) gem providing a data-driven narrati
 ---
 
 ## Become a GitHub Sponsor
+
+**Prefer a one-time purchase?** Heathen's own storefront is live, direct source access at [heathen.group/pricing](https://heathen.group/pricing/), no sponsorship required.
+
 [![Discord](https://img.shields.io/badge/Discord--1877F2?style=social&logo=discord)](https://discord.gg/6X3xrRc)
 [![GitHub followers](https://img.shields.io/github/followers/heathen-engineering?style=social)](https://github.com/heathen-engineering?tab=followers)
 Support Heathen by becoming a [GitHub Sponsor](https://github.com/sponsors/heathen-engineering). Sponsorship directly funds the development and maintenance of free tools like this, as well as our game development [Knowledge Base](https://heathen.group/) and community on [Discord](https://discord.gg/6X3xrRc).
 
 Sponsors also get access to our private SourceRepo, which includes developer tools for O3DE, Unreal, Unity, and Godot.
-Learn more or explore other ways to support @ [heathen.group/kb](https://heathen.group/kb/do-more/)
+Learn more or explore other ways to support @ [heathen.group/kb](https://heathen.group/pricing/)
 
 ### Ogham Storyteller Toolkit
 The **Ogham Storyteller Toolkit** is a sponsor-exclusive extension to this gem that adds professional narrative production features, including:
