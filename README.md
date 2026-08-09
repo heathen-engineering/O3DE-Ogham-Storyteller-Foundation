@@ -453,7 +453,7 @@ A **▶ Play from Node** button in the form editor opens the **OghamPlayPanel** 
 
 1. Select any entry node in the tree or graph.
 2. Click **▶ Play from Node** in the form panel.
-3. The *Set Initial State* dialog appears. Pre-populate GameplayTag values before play begins. Named initial states can be saved to and loaded from `Assets/Storyteller/OghamTestStates.json` in the project directory.
+3. The *Set Initial State* dialog appears. Pre-populate GameplayTag values before play begins. Named initial states can be saved to and loaded from `Archive/Assets/Storyteller/OghamTestStates.json` in the project directory.
 4. Click **▶ Play** to start.
 
 **Play panel layout**
