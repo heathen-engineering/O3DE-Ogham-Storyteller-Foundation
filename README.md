@@ -9,7 +9,7 @@
 
 # Ogham Storyteller Foundaiton Gem
 ![License](https://img.shields.io/badge/License-Apache_2.0-blue?style=flat-square)
-![Maintained](https://img.shields.io/badge/Maintained%3F-yes-green?style=flat-square)
+[![Maintained](https://img.shields.io/badge/Maintained-On%20Codeberg-brightgreen?style=flat-square)](https://codeberg.org/Heathen-Engineering/O3DE-Ogham-Storyteller-Foundation)
 ![O3DE](https://img.shields.io/badge/O3DE-25.10%20%2B-%2300AEEF?style=flat-square&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0xMiAxTDEgNy40djkuMkwxMiAyM2wxMS02LjRWNy40TDEyIDF6bTkuMSAxNC45TDExLjUgMjEuM2wtOC42LTYuNFY4LjFsOC42LTYuNCA5LjEgNi40djYuOHpNMTEuNSA0LjZMMi45IDkuNnY0LjhsOC42IDUuMSA4LjYtNS4xVjkuNmwtOC42LTUuMHoiLz48L3N2Zz4=)
 
 An [Open 3D Engine (O3DE)](https://o3de.org) gem providing a data-driven narrative and dialogue management system. Decouples story logic from UI presentation using a tag-hash state machine — supporting branching dialogue, persistent world state, conditions, operations, and save/load snapshots.
